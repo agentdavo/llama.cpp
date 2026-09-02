@@ -62,6 +62,10 @@
 #include "ggml-hexagon.h"
 #endif
 
+#ifdef GGML_USE_NPU
+#include "ggml-npu.h"
+#endif
+
 #ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
 #endif
@@ -152,6 +156,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_HEXAGON
         register_backend(ggml_backend_hexagon_reg());
+#endif
+#ifdef GGML_USE_NPU
+        register_backend(ggml_backend_npu_reg());
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());

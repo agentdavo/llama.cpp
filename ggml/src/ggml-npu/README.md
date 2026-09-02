@@ -14,11 +14,29 @@ for VPU 3720**, the seam through which the host offloads compute to the accelera
 | Piece | State |
 |-------|-------|
 | `hpi-3720/` HPI + Q8_0 GEMM contract | **done** — API + portable CPU reference, self-tested |
+| `hpi-3720/` GGUF reader + offload harness | **done** — reads Q8_0 tensors from a `.gguf`, runs them through the offload |
+| `ggml-npu.cpp` host backend glue | **done** — registers via `ggml_add_backend(NPU)`; llama enumerates it as an `ACCEL` device |
 | `hpi-3720/` NPU-3720 hardware path | **stub** — waits on the NCE descriptor / Q8_0 schedule (see outer CLAUDE.md "long game") |
-| `ggml-npu.cpp` host backend glue | **not started** — will register with `ggml_add_backend(NPU)` |
 
 First target op is **Q8_0 offload** (a mul_mat whose weight operand is Q8_0-quantized), because Q8_0
 is a clean, well-understood block format and a natural fit for the NPU's INT8 MAC array.
+
+## Build & verify
+
+```sh
+cmake -S . -B build -DGGML_NPU=ON        # from the llama.cpp root
+cmake --build build --target test-backend-ops -j
+./build/bin/test-backend-ops test -b NPU -o MUL_MAT
+```
+
+`test-backend-ops` enumerates every registered backend (so it confirms the NPU device is detected)
+and runs the op suite against it. The NPU backend declines every op except Q8_0 `mul_mat`, and passes
+all Q8_0 `mul_mat` cases — batched and GQA-broadcast included — against ggml's own reference. Since
+the compute runs on the hpi CPU reference, results are correct today; a `-DGGML_NPU_HW=ON` build will
+route them to silicon with no change to this backend.
+
+The device shows up as an `ACCEL` named `NPU`, so `-ngl` / `-ncmoe` weight-placement has an NPU
+target: Q8_0 weight matmuls it accepts get offloaded; everything else stays on CPU.
 
 ## Cross-platform for now
 

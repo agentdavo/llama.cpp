@@ -19,7 +19,10 @@ behind this interface.
 | `hpi.c` | Dispatcher: shape validation + backend selection (AUTO → NPU if usable, else CPU) |
 | `hpi_cpu.c` | Portable CPU reference backend — the golden reference the NPU path must match |
 | `hpi_npu_3720.c` | The real VPU-3720 backend — **stub**, guarded by `HPI_HAVE_NPU_3720` |
-| `test/test_q8_0_gemm.c` | Deterministic self-test vs. an independent double-precision reference |
+| `hpi_gguf.h` / `hpi_gguf.c` | Minimal read-only GGUF parser (enumerate tensors, reach Q8_0 bytes) |
+| `gguf_q8_0_offload.c` | Tool: point the offload at a real `.gguf` (`--list` / `--tensor` / `--rows` / `--check`) |
+| `test/test_q8_0_gemm.c` | Deterministic GEMM self-test vs. an independent double-precision reference |
+| `test/test_gguf.c` | Writes a synthetic Q8_0 GGUF, reads it back, and offloads it end to end |
 
 ## The op
 
@@ -44,9 +47,19 @@ ctest --test-dir build --output-on-failure
 
 Verified with gcc and clang under the project's strict set
 (`-std=c11 -Wall -Wextra -Wpedantic -Werror -Wconversion -Wshadow -Wcast-align -Wpointer-arith`).
-The test uses fixed seeds and fixed shapes and compares against a reference accumulated in `double`
+The tests use fixed seeds and fixed shapes and compare against a reference accumulated in `double`
 over the *same* quantized weights (so only float-vs-double accumulation differs) — max relative error
 is ~1e-4.
+
+### Offload a real model
+
+```sh
+# once you have a Q8_0 GGUF (e.g. Qwen3.5-0.8B-Q8_0.gguf) on a machine that can reach Hugging Face:
+./build/gguf_q8_0_offload model.gguf --list                 # list its Q8_0 tensors
+./build/gguf_q8_0_offload model.gguf --tensor <name> --rows 32 --check
+```
+
+`test_gguf` leaves a small `hpi_synth_q8_0.gguf` you can feed to the tool without any download.
 
 ## Design notes (from the `agentdavo/npu` Carmack discipline)
 

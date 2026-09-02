@@ -20,7 +20,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 add_library(hpi3720 STATIC
     hpi.c
     hpi_cpu.c
-    hpi_npu_3720.c)
+    hpi_npu_3720.c
+    hpi_gguf.c)
 
 target_include_directories(hpi3720 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -38,12 +39,21 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wcast-align -Wpointer-arith)
 endif()
 
+# gguf_q8_0_offload: point the offload at a real .gguf model (or the synthetic one from the tests).
+add_executable(gguf_q8_0_offload gguf_q8_0_offload.c)
+target_link_libraries(gguf_q8_0_offload PRIVATE hpi3720)
+if (NOT WIN32)
+    target_link_libraries(gguf_q8_0_offload PRIVATE m)
+endif()
+
 if (HPI3720_BUILD_TESTS)
     enable_testing()
-    add_executable(test_q8_0_gemm test/test_q8_0_gemm.c)
-    target_link_libraries(test_q8_0_gemm PRIVATE hpi3720)
-    if (NOT WIN32)
-        target_link_libraries(test_q8_0_gemm PRIVATE m)
-    endif()
-    add_test(NAME hpi3720_q8_0_gemm COMMAND test_q8_0_gemm)
+    foreach (t test_q8_0_gemm test_gguf)
+        add_executable(${t} test/${t}.c)
+        target_link_libraries(${t} PRIVATE hpi3720)
+        if (NOT WIN32)
+            target_link_libraries(${t} PRIVATE m)
+        endif()
+        add_test(NAME hpi3720_${t} COMMAND ${t})
+    endforeach()
 endif()
