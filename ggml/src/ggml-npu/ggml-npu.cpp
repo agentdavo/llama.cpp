@@ -93,7 +93,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
 // --- backend interface -------------------------------------------------------------------------- //
 
 static const char * ggml_backend_npu_get_name(ggml_backend_t backend) {
-    return "NPU";
+    return "hpi-3720";
     GGML_UNUSED(backend);
 }
 
@@ -164,7 +164,9 @@ bool ggml_backend_is_npu(ggml_backend_t backend) {
 // --- device interface --------------------------------------------------------------------------- //
 
 static const char * ggml_backend_npu_device_get_name(ggml_backend_dev_t dev) {
-    return "NPU";
+    // the name `--device <name>` matches (case-insensitive). Single device, so no index suffix
+    // (cf. Hexagon: reg "HTP" -> devices "HTP0"/"HTP1"; here reg "NPU" -> device "hpi-3720").
+    return "hpi-3720";
     GGML_UNUSED(dev);
 }
 

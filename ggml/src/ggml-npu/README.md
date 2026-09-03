@@ -35,8 +35,18 @@ all Q8_0 `mul_mat` cases — batched and GQA-broadcast included — against ggml
 the compute runs on the hpi CPU reference, results are correct today; a `-DGGML_NPU_HW=ON` build will
 route them to silicon with no change to this backend.
 
-The device shows up as an `ACCEL` named `NPU`, so `-ngl` / `-ncmoe` weight-placement has an NPU
-target: Q8_0 weight matmuls it accepts get offloaded; everything else stays on CPU.
+The device shows up as an `ACCEL` named `hpi-3720` (reg family `NPU`, mirroring Hexagon's
+`HTP`/`HTP0` split), so it is selectable and an offload target:
+
+```sh
+llama-cli --list-devices                 # -> hpi-3720: Intel NPU 2.7 / VPU 3720 (...)
+llama-cli --device hpi-3720 -ngl 999 -m model-q8_0.gguf -p "..."
+```
+
+`--device` matches the name case-insensitively. Q8_0 weight matmuls the device accepts get
+offloaded; everything else falls back to CPU. (`-ncmoe`/`-cmoe` pin MoE experts to CPU, so keep
+them low/unset if you want expert matmuls to reach `hpi-3720`.) Note this is still the CPU
+reference — selecting it is correctness/plumbing, not speed, until the silicon path lands.
 
 ## Cross-platform for now
 
