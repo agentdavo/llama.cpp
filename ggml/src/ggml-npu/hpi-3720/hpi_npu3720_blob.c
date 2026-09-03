@@ -62,10 +62,13 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
                                   hpi_npu3720_blob_io *io) {
     if (!op || !blob || !blob_len || !io) return HPI_EINVAL;
 
-    /* The cached blobs are M=1 (decode) matmuls (emit_m1mm/emit_buildblob). llama's prefill runs these
-     * ops with M>1 (many tokens at once); there is no M>1 blob yet, so decline and let npu_gemm fall
-     * back to the CPU reference for prefill. Decode (M=1) is where the DPU is used. */
-    if (op->M != 1) return HPI_UNAVAILABLE;
+    /* Pick the blob variant by batch size M. M=1 -> the decode blob "<key>.blob" (emit_m1mm). 2..256 ->
+     * the prefill blob "<key>.m256.blob" (emit_stream M=256, no-ReLU); npu_gemm pads op->M rows into its
+     * 256-row input. M>256 has no blob (run with -ub<=256 so prefill ubatches are <=256) -> CPU reference. */
+    const char *suffix;
+    if (op->M == 1)        suffix = "";
+    else if (op->M <= 256) suffix = ".m256";
+    else                   return HPI_UNAVAILABLE;
 
     const char *cache = getenv("NPU_BLOB_CACHE");
     if (!cache || !cache[0]) return HPI_UNAVAILABLE;   /* no cache configured -> CPU reference */
@@ -76,15 +79,15 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
     const uint64_t key   = npu_weight_key((const unsigned char *)op->w, wbytes);
 
     char path[1024];
-    int n = snprintf(path, sizeof path, "%s/%016llx.blob", cache, (unsigned long long)key);
+    int n = snprintf(path, sizeof path, "%s/%016llx%s.blob", cache, (unsigned long long)key, suffix);
     if (n <= 0 || (size_t)n >= sizeof path) return HPI_UNAVAILABLE;
 
     unsigned char *buf = NULL; size_t len = 0;
     if (npu_read_file(path, &buf, &len) != 0) return HPI_UNAVAILABLE;   /* not cached -> CPU reference */
 
-    { static int said = 0; if (!said) { said = 1;
-        fprintf(stderr, "hpi-3720: loaded cached DPU blob (key=%016llx N=%lld K=%lld, %zu B) — this op runs on the DPU.\n",
-                (unsigned long long)key, (long long)op->N, (long long)op->K, len); } }
+    { static int said1 = 0, said2 = 0; int *sp = (op->M == 1) ? &said1 : &said2; if (!*sp) { *sp = 1;
+        fprintf(stderr, "hpi-3720: loaded DPU blob %-5s (M=%lld N=%lld K=%lld) — this op runs on the DPU.\n",
+                suffix[0] ? suffix : ".m1", (long long)op->M, (long long)op->N, (long long)op->K); } }
     *blob = buf; *blob_len = len;
     io->arg_x = 0;   /* 'x'      (input,  sym 1) */
     io->arg_y = 1;   /* 'Relu_5' (output, sym 2) */

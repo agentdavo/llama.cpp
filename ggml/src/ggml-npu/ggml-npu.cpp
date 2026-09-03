@@ -30,6 +30,8 @@ struct ggml_backend_npu_context {
     hpi_device * hpi = nullptr;   // owned; opened at init, closed at free
     uint64_t     n_mul_mat = 0;   // Q8_0 mul_mat ops executed on this backend
     uint64_t     n_flop    = 0;   // 2*M*N*K summed, for the free-time summary
+    uint64_t     n_m_gt1   = 0;   // ops with M>1 (prefill-shaped)
+    int64_t      max_m     = 0;   // largest M seen (diagnose prefill batching)
     bool         logged_first = false;
 };
 
@@ -83,6 +85,8 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
 
             ctx->n_mul_mat++;
             ctx->n_flop += 2ull * (uint64_t)M * (uint64_t)N * (uint64_t)K;
+            if (M > 1) ctx->n_m_gt1++;
+            if (M > ctx->max_m) ctx->max_m = M;
             if (!ctx->logged_first) {
                 ctx->logged_first = true;
                 GGML_LOG_INFO("hpi-3720: computing Q8_0 mul_mat on the NPU backend "
@@ -131,8 +135,9 @@ static const char * ggml_backend_npu_get_name(ggml_backend_t backend) {
 static void ggml_backend_npu_free(ggml_backend_t backend) {
     ggml_backend_npu_context * ctx = (ggml_backend_npu_context *) backend->context;
     if (ctx) {
-        GGML_LOG_INFO("hpi-3720: backend ran %llu Q8_0 mul_mat op(s), %.3f GFLOP total\n",
-                      (unsigned long long) ctx->n_mul_mat, (double) ctx->n_flop / 1e9);
+        GGML_LOG_INFO("hpi-3720: backend ran %llu Q8_0 mul_mat op(s) (%llu with M>1, max M=%lld), %.3f GFLOP total\n",
+                      (unsigned long long) ctx->n_mul_mat, (unsigned long long) ctx->n_m_gt1,
+                      (long long) ctx->max_m, (double) ctx->n_flop / 1e9);
         NPU_TRACE("backend ran %llu Q8_0 mul_mat op(s), %.3f GFLOP total\n",
                   (unsigned long long) ctx->n_mul_mat, (double) ctx->n_flop / 1e9);
         hpi_close(ctx->hpi);

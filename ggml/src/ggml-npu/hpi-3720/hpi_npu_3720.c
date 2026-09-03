@@ -249,10 +249,14 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     const npu_graph_arg *ax = &tmp.g.arg[tmp.io.arg_x];
     const npu_graph_arg *ay = &tmp.g.arg[tmp.io.arg_y];
 
-    /* Shapes must match what we're about to compute: X is M*K, Y is M*N. */
-    if (ax->elems != (size_t)op->M * (size_t)op->K ||
-        ay->elems != (size_t)op->M * (size_t)op->N) {
-        free(tmp.blob); *st = HPI_EDEVICE; return NULL;
+    /* The blob may batch MORE rows than this op: a shared M=256 prefill blob serves any op->M<=256, its
+     * input is blobM*K and output blobM*N with blobM = ax->elems/K >= op->M. npu_gemm stages op->M rows
+     * (zero-padding the rest) and reads back op->M rows. A mismatch is not a device error -> decline so
+     * npu_gemm falls back to the CPU reference. */
+    if (op->K == 0 || ax->elems % (size_t)op->K != 0) { free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL; }
+    const size_t blobM = ax->elems / (size_t)op->K;
+    if (blobM < (size_t)op->M || ay->elems != blobM * (size_t)op->N) {
+        free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL;
     }
 
     /* Step 3: allocate NPU-visible buffers for the input and output arguments and bind them. */
@@ -317,8 +321,12 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
     const npu_graph_arg *ax = &s->g.arg[s->io.arg_x];
     const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
 
-    /* Stage activations X (host f32) into the device input buffer in the blob's precision. */
-    st = stage_in_f32(s->x_mem, ax->precision, op->x, (size_t)op->M * (size_t)op->K);
+    /* Stage activations X (host f32) into the device input buffer in the blob's precision. When this op
+     * uses fewer rows than the shared blob's M (a M=256 prefill blob serving op->M<256), zero the buffer
+     * first so the unused rows compute on zeros — their output rows are simply not read back. */
+    const size_t staged = (size_t)op->M * (size_t)op->K;
+    if (ax->elems > staged) memset(s->x_mem, 0, ax->bytes);
+    st = stage_in_f32(s->x_mem, ax->precision, op->x, staged);
     if (st != HPI_OK) return st;
 
     /* Step 4b: initialize the graph on the device once (loads baked weights / builds descriptors),
