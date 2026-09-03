@@ -53,6 +53,13 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
 
     const int64_t K = ne00, N = ne01, M = ne11;
 
+    // ggml can emit empty mul_mat nodes (M=0 — e.g. a zero-token ubatch tail or an unused branch);
+    // there is nothing to compute and the HPI layer rejects M<=0, so skip them exactly as the CPU
+    // backend's 0-iteration loops do. (N/K are >0 for any real Q8_0 weight, guarded for safety.)
+    if (M == 0 || N == 0 || K == 0) {
+        return;
+    }
+
     // grouped/broadcast batch dims, exactly as ggml mul_mat: src0's batch may be smaller than src1's
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -68,6 +75,10 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
 
             const hpi_q8_0_gemm op = { M, N, K, w, x, y };
             const hpi_status st = hpi_q8_0_gemm_run(ctx->hpi, &op);
+            if (st != HPI_OK) {
+                GGML_LOG_ERROR("hpi-3720: Q8_0 gemm failed st=%d (%s) op='%s' M=%lld N=%lld K=%lld\n",
+                               (int)st, hpi_status_str(st), dst->name, (long long)M, (long long)N, (long long)K);
+            }
             GGML_ASSERT(st == HPI_OK);
 
             ctx->n_mul_mat++;
