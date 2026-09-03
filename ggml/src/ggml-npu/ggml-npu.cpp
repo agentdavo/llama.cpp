@@ -203,6 +203,17 @@ bool ggml_backend_is_npu(ggml_backend_t backend) {
 
 // --- device interface --------------------------------------------------------------------------- //
 
+// GPU-class whole-layer offload (NPU_OFFLOAD_GPU=1) vs the default ACCEL op-fallback. GPU-type makes
+// -ngl place whole layers (full-M mul_mats) on the NPU — VERIFIED routing — but llama then also
+// pre-allocates the layer's KV cache on our device buft and expects us to run its ops (SET_ROWS, ...),
+// which we do not yet (that needs full layer-op coverage / CPU-passthrough). So it is OPT-IN and still
+// WIP; default stays ACCEL (correct: opportunistic Q8_0 mul_mat offload, everything else on CPU).
+static bool ggml_backend_npu_gpu_offload(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("NPU_OFFLOAD_GPU"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v == 1;
+}
+
 static const char * ggml_backend_npu_device_get_name(ggml_backend_dev_t dev) {
     // the name `--device <name>` matches (case-insensitive). Single device, so no index suffix
     // (cf. Hexagon: reg "HTP" -> devices "HTP0"/"HTP1"; here reg "NPU" -> device "hpi-3720").
@@ -216,13 +227,19 @@ static const char * ggml_backend_npu_device_get_description(ggml_backend_dev_t d
 }
 
 static void ggml_backend_npu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
+    // Our "device memory" is host RAM (the buffer-type is host-backed; the DPU DMAs it). Report a
+    // generous amount so -ngl layer-fitting places whole layers on us. NPU_MEM_MB overrides.
+    const char * env = getenv("NPU_MEM_MB");
+    size_t mb = env && env[0] ? (size_t) strtoull(env, NULL, 10) : (size_t) 96 * 1024;   // default 96 GiB
+    *total = mb * 1024 * 1024;
+    *free  = *total;
     GGML_UNUSED(dev);
 }
 
 static enum ggml_backend_dev_type ggml_backend_npu_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    // GPU (opt-in) puts whole layers on the NPU via -ngl (ggml-hexagon pattern); ACCEL (default) is
+    // op-fallback only. See ggml_backend_npu_gpu_offload above.
+    return ggml_backend_npu_gpu_offload() ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_ACCEL;
     GGML_UNUSED(dev);
 }
 
@@ -263,7 +280,7 @@ static void ggml_backend_npu_device_get_props(ggml_backend_dev_t dev, struct ggm
     ggml_backend_npu_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ false,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ ggml_backend_npu_gpu_offload(),   // GPU mode exposes a host buft (KV cache); ACCEL: none
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
@@ -276,8 +293,62 @@ static ggml_backend_t ggml_backend_npu_device_init_backend(ggml_backend_dev_t de
     GGML_UNUSED(params);
 }
 
+// A distinct, host-backed buffer-type OWNED by hpi-3720. Physically host memory (the DPU reads it by
+// DMA), but a DISTINCT buft identity (not the CPU's) so ggml_backend_sched attributes weights placed
+// here by -ngl to hpi-3720 and runs their mul_mats on the NPU — the ggml-hexagon whole-layer pattern,
+// not the ACCEL op-fallback. No repack yet: weights stay Q8_0 in host memory, so build_blob still
+// finds the per-tensor DPU blob by hashing op->w (a repack-on-set_tensor is the later optimization).
+static const char * ggml_backend_npu_buft_get_name(ggml_backend_buffer_type_t buft) {
+    return "hpi-3720";
+    GGML_UNUSED(buft);
+}
+static ggml_backend_buffer_t ggml_backend_npu_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // delegate to the CPU host buffer (which owns + frees the memory), then re-label it as ours
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    if (buf) buf->buft = buft;
+    return buf;
+}
+static size_t ggml_backend_npu_buft_get_alignment(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    GGML_UNUSED(buft);
+}
+static bool ggml_backend_npu_buft_is_host(ggml_backend_buffer_type_t buft) {
+    // FALSE on purpose: a device (non-host) buft is what makes ggml_backend_sched treat weights placed
+    // here as DEVICE-resident and run their ops on hpi-3720 (a host-layout buft would be handled by the
+    // CPU backend). The memory is still physically host RAM (delegated CPU buffer), so op->w stays
+    // readable for build_blob and the DPU DMAs it — this is the integrated/unified-memory case.
+    return false;
+    GGML_UNUSED(buft);
+}
+static ggml_backend_buffer_type_t ggml_backend_npu_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface = */ {
+            /* .get_name       = */ ggml_backend_npu_buft_get_name,
+            /* .alloc_buffer   = */ ggml_backend_npu_buft_alloc_buffer,
+            /* .get_alignment  = */ ggml_backend_npu_buft_get_alignment,
+            /* .get_max_size   = */ NULL,
+            /* .get_alloc_size = */ NULL,
+            /* .is_host        = */ ggml_backend_npu_buft_is_host,
+        },
+        /* .device  = */ NULL,
+        /* .context = */ NULL,
+    };
+    buft.device = ggml_backend_reg_dev_get(ggml_backend_npu_reg(), 0);
+    return &buft;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_npu_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type();   // host memory: the fake NPU reads/writes it directly
+    // GPU mode: our distinct device buft (-ngl places WEIGHTS here). ACCEL mode: plain host memory.
+    return ggml_backend_npu_gpu_offload() ? ggml_backend_npu_buffer_type() : ggml_backend_cpu_buffer_type();
+    GGML_UNUSED(dev);
+}
+
+// Host buffer-type for tensors that must stay CPU-runnable (the KV cache + its SET_ROWS/CPY updates,
+// output, etc.). Weights go to our device buft (above) and run on the NPU; everything else in this
+// host buft stays with the CPU backend — the ggml-hexagon two-buft split. Without this llama would
+// pre-allocate the KV cache in our device buft and fail (we cannot run SET_ROWS).
+static ggml_backend_buffer_type_t ggml_backend_npu_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    return ggml_backend_cpu_buffer_type();
     GGML_UNUSED(dev);
 }
 
@@ -288,7 +359,8 @@ static ggml_backend_buffer_t ggml_backend_npu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_npu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+    // our own device buft (weights placed by -ngl) + any host buft (activations/inputs from the CPU).
+    return buft == ggml_backend_npu_buffer_type() || ggml_backend_buft_is_host(buft);
     GGML_UNUSED(dev);
 }
 
@@ -300,7 +372,7 @@ static const struct ggml_backend_device_i ggml_backend_npu_device_i = {
     /* .get_props            = */ ggml_backend_npu_device_get_props,
     /* .init_backend         = */ ggml_backend_npu_device_init_backend,
     /* .get_buffer_type      = */ ggml_backend_npu_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
+    /* .get_host_buffer_type = */ ggml_backend_npu_device_get_host_buffer_type,
     /* .buffer_from_host_ptr = */ ggml_backend_npu_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_npu_device_supports_op,
     /* .supports_buft        = */ ggml_backend_npu_device_supports_buft,
