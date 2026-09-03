@@ -22,18 +22,40 @@
 #include <cstdio>
 #include <cstdlib>
 
+static bool ggml_backend_npu_gpu_offload(void);   // NPU_OFFLOAD_GPU: whole-layer GPU offload vs default ACCEL
+
 // Direct-to-stderr trace, independent of the ggml log callback (tools like llama-bench install a
 // callback that drops info logs). Enabled by GGML_NPU_VERBOSE=1 so a run can be *shown* to compute.
 #define NPU_TRACE(...) do { if (getenv("GGML_NPU_VERBOSE")) { fprintf(stderr, "hpi-3720: " __VA_ARGS__); fflush(stderr); } } while (0)
 
 struct ggml_backend_npu_context {
     hpi_device * hpi = nullptr;   // owned; opened at init, closed at free
-    uint64_t     n_mul_mat = 0;   // Q8_0 mul_mat ops executed on this backend
+    ggml_backend_t cpu = nullptr; // internal CPU backend for GPU-passthrough: non-DPU nodes run here
+    uint64_t     n_mul_mat = 0;   // Q8_0 mul_mat ops executed on the DPU path
     uint64_t     n_flop    = 0;   // 2*M*N*K summed, for the free-time summary
     uint64_t     n_m_gt1   = 0;   // ops with M>1 (prefill-shaped)
+    uint64_t     n_cpu_pass = 0;  // nodes passed through to the internal CPU backend
     int64_t      max_m     = 0;   // largest M seen (diagnose prefill batching)
     bool         logged_first = false;
 };
+
+// A cacheable Q8_0 mul_mat shape: build_blob_cache authors an M=1 (decode) blob for any N%SLABCH==0,
+// and an M<=256 (prefill) blob for K in {1024,2048}. Match that so GPU-passthrough routes exactly the
+// ops with a DPU blob to the DPU, and sends the rest (lm_head N%256!=0, M>256, K=3072 prefill) to the
+// fast CPU backend rather than the naive hpi CPU reference.
+static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT) return false;
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    if (!src0 || !src1) return false;
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
+    const int64_t K = src0->ne[0], N = src0->ne[1], M = op->ne[1];
+    if (N % 256 != 0 || K % 32 != 0) return false;
+    if (M == 1) return true;                    // decode blob (any K)
+    if (M <= 256 && (K == 1024 || K == 2048)) return true;   // prefill blob (fits CMX)
+    return false;
+}
 
 // --- the offloaded op: Q8_0 mul_mat through the HPI --------------------------------------------- //
 
@@ -86,7 +108,9 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
             ctx->n_mul_mat++;
             ctx->n_flop += 2ull * (uint64_t)M * (uint64_t)N * (uint64_t)K;
             if (M > 1) ctx->n_m_gt1++;
-            if (M > ctx->max_m) ctx->max_m = M;
+            if (M > ctx->max_m) { ctx->max_m = M;
+                NPU_TRACE("DPU mul_mat new max M=%lld (op '%s' N=%lld K=%lld)\n",
+                          (long long)M, dst->name, (long long)N, (long long)K); }
             if (!ctx->logged_first) {
                 ctx->logged_first = true;
                 GGML_LOG_INFO("hpi-3720: computing Q8_0 mul_mat on the NPU backend "
@@ -102,26 +126,59 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
 static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_npu_context * ctx = (ggml_backend_npu_context *) backend->context;
 
+    if (!ctx->cpu) {
+        // ACCEL mode (default): the sched assigns us only our own ops (Q8_0 mul_mat + structural).
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
+            switch (node->op) {
+                case GGML_OP_MUL_MAT:
+                    ggml_backend_npu_mul_mat(ctx, node);
+                    break;
+                case GGML_OP_NONE:
+                case GGML_OP_RESHAPE:
+                case GGML_OP_VIEW:
+                case GGML_OP_PERMUTE:
+                case GGML_OP_TRANSPOSE:
+                    break;
+                default:
+                    GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // GPU-passthrough (NPU_OFFLOAD_GPU): -ngl placed whole layers here, so we get every op. Run the
+    // cacheable Q8_0 mul_mats on the DPU and pass everything else (norms, rope, softmax, KV SET_ROWS,
+    // lm_head, non-cacheable GEMMs) to the internal CPU backend — our buffers are host memory, so the
+    // CPU computes them in place. Nodes are processed in order; the pending CPU batch is flushed before
+    // each DPU op so data dependencies are honored.
+    struct ggml_init_params ip = {
+        /* .mem_size   = */ ggml_graph_overhead_custom(cgraph->size, false) + ggml_tensor_overhead(),
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    struct ggml_context * gctx = ggml_init(ip);
+    struct ggml_cgraph * batch = ggml_new_graph_custom(gctx, cgraph->size, false);
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
-
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            continue;
-        }
-        switch (node->op) {
-            case GGML_OP_MUL_MAT:
-                ggml_backend_npu_mul_mat(ctx, node);
-                break;
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                break;
-            default:
-                GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+        if (node->op == GGML_OP_NONE) continue;
+        if (ggml_backend_npu_dpu_cacheable(node)) {
+            if (batch->n_nodes > 0) {
+                ggml_backend_graph_compute(ctx->cpu, batch);
+                ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
+                batch->n_nodes = 0;
+            }
+            ggml_backend_npu_mul_mat(ctx, node);
+        } else {
+            batch->nodes[batch->n_nodes++] = node;
         }
     }
+    if (batch->n_nodes > 0) {
+        ggml_backend_graph_compute(ctx->cpu, batch);
+        ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
+    }
+    ggml_free(gctx);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -135,11 +192,13 @@ static const char * ggml_backend_npu_get_name(ggml_backend_t backend) {
 static void ggml_backend_npu_free(ggml_backend_t backend) {
     ggml_backend_npu_context * ctx = (ggml_backend_npu_context *) backend->context;
     if (ctx) {
-        GGML_LOG_INFO("hpi-3720: backend ran %llu Q8_0 mul_mat op(s) (%llu with M>1, max M=%lld), %.3f GFLOP total\n",
+        GGML_LOG_INFO("hpi-3720: backend ran %llu Q8_0 mul_mat op(s) on the DPU (%llu with M>1, max M=%lld), "
+                      "%llu node(s) passed to the CPU backend, %.3f GFLOP total\n",
                       (unsigned long long) ctx->n_mul_mat, (unsigned long long) ctx->n_m_gt1,
-                      (long long) ctx->max_m, (double) ctx->n_flop / 1e9);
+                      (long long) ctx->max_m, (unsigned long long) ctx->n_cpu_pass, (double) ctx->n_flop / 1e9);
         NPU_TRACE("backend ran %llu Q8_0 mul_mat op(s), %.3f GFLOP total\n",
                   (unsigned long long) ctx->n_mul_mat, (double) ctx->n_flop / 1e9);
+        if (ctx->cpu) ggml_backend_free(ctx->cpu);
         hpi_close(ctx->hpi);
         delete ctx;
     }
@@ -187,6 +246,19 @@ ggml_backend_t ggml_backend_npu_init(void) {
             GGML_LOG_INFO("%s: NPU backend using hpi backend '%s' (hardware=%d)\n", __func__, info.name, info.is_hw);
         }
     }
+    if (ggml_backend_npu_gpu_offload()) {
+        // GPU-passthrough mode: an internal CPU backend computes every non-DPU node of the whole layers
+        // that -ngl places on us (see ggml_backend_npu_graph_compute).
+        ctx->cpu = ggml_backend_cpu_init();
+        if (!ctx->cpu) {
+            GGML_LOG_ERROR("%s: NPU_OFFLOAD_GPU set but ggml_backend_cpu_init() failed\n", __func__);
+            hpi_close(ctx->hpi); delete ctx; return NULL;
+        }
+        GGML_LOG_INFO("%s: GPU-passthrough offload ON — whole layers via -ngl; cacheable Q8_0 mul_mats "
+                      "on the DPU, all other ops on an internal CPU backend\n", __func__);
+    }
+    fprintf(stderr, "hpi-3720: offload mode = %s\n",
+            ggml_backend_npu_gpu_offload() ? "GPU-passthrough (whole-layer via -ngl)" : "ACCEL (op-fallback)");
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_npu_guid(),
@@ -245,6 +317,12 @@ static enum ggml_backend_dev_type ggml_backend_npu_device_get_type(ggml_backend_
 
 // true only for the ops we compute: Q8_0 mul_mat and the free-of-charge structural ops.
 static bool ggml_backend_npu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (ggml_backend_npu_gpu_offload()) {
+        // GPU-passthrough: cacheable Q8_0 mul_mats run on the DPU, every other op is delegated to the
+        // internal CPU backend (ggml-cpu covers the full op set), so we accept any op — this is what
+        // lets -ngl place whole layers (incl. their KV cache / SET_ROWS / norms) on the NPU device.
+        return true;
+    }
     switch (op->op) {
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
