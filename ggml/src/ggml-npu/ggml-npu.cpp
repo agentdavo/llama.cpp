@@ -19,9 +19,18 @@
 #include "hpi-3720/hpi.h"
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+
+// Direct-to-stderr trace, independent of the ggml log callback (tools like llama-bench install a
+// callback that drops info logs). Enabled by GGML_NPU_VERBOSE=1 so a run can be *shown* to compute.
+#define NPU_TRACE(...) do { if (getenv("GGML_NPU_VERBOSE")) { fprintf(stderr, "hpi-3720: " __VA_ARGS__); fflush(stderr); } } while (0)
 
 struct ggml_backend_npu_context {
     hpi_device * hpi = nullptr;   // owned; opened at init, closed at free
+    uint64_t     n_mul_mat = 0;   // Q8_0 mul_mat ops executed on this backend
+    uint64_t     n_flop    = 0;   // 2*M*N*K summed, for the free-time summary
+    bool         logged_first = false;
 };
 
 // --- the offloaded op: Q8_0 mul_mat through the HPI --------------------------------------------- //
@@ -60,6 +69,17 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
             const hpi_q8_0_gemm op = { M, N, K, w, x, y };
             const hpi_status st = hpi_q8_0_gemm_run(ctx->hpi, &op);
             GGML_ASSERT(st == HPI_OK);
+
+            ctx->n_mul_mat++;
+            ctx->n_flop += 2ull * (uint64_t)M * (uint64_t)N * (uint64_t)K;
+            if (!ctx->logged_first) {
+                ctx->logged_first = true;
+                GGML_LOG_INFO("hpi-3720: computing Q8_0 mul_mat on the NPU backend "
+                              "(first op '%s': M=%lld N=%lld K=%lld)\n",
+                              dst->name, (long long)M, (long long)N, (long long)K);
+                NPU_TRACE("computing Q8_0 mul_mat on the NPU backend (first op '%s': M=%lld N=%lld K=%lld)\n",
+                          dst->name, (long long)M, (long long)N, (long long)K);
+            }
         }
     }
 }
@@ -100,6 +120,10 @@ static const char * ggml_backend_npu_get_name(ggml_backend_t backend) {
 static void ggml_backend_npu_free(ggml_backend_t backend) {
     ggml_backend_npu_context * ctx = (ggml_backend_npu_context *) backend->context;
     if (ctx) {
+        GGML_LOG_INFO("hpi-3720: backend ran %llu Q8_0 mul_mat op(s), %.3f GFLOP total\n",
+                      (unsigned long long) ctx->n_mul_mat, (double) ctx->n_flop / 1e9);
+        NPU_TRACE("backend ran %llu Q8_0 mul_mat op(s), %.3f GFLOP total\n",
+                  (unsigned long long) ctx->n_mul_mat, (double) ctx->n_flop / 1e9);
         hpi_close(ctx->hpi);
         delete ctx;
     }

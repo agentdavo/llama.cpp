@@ -48,6 +48,28 @@ offloaded; everything else falls back to CPU. (`-ncmoe`/`-cmoe` pin MoE experts 
 them low/unset if you want expert matmuls to reach `hpi-3720`.) Note this is still the CPU
 reference — selecting it is correctness/plumbing, not speed, until the silicon path lands.
 
+### Prove it computes (no download)
+
+Synthesize a tiny valid Q8_0 llama model, then run it and watch the backend log its work:
+
+```sh
+python3 ggml/src/ggml-npu/hpi-3720/make_tiny_q8_0_gguf.py /tmp/tiny-q8_0.gguf   # needs numpy
+GGML_NPU_VERBOSE=1 ./build/bin/llama-bench -m /tmp/tiny-q8_0.gguf -ngl 999 --device hpi-3720 -p 16 -n 8
+```
+
+`llama-bench` drives the model with random tokens (no tokenizer needed) and prints, e.g.:
+
+```
+hpi-3720: computing Q8_0 mul_mat on the NPU backend (first op 'Qcur-0': M=16 N=64 K=64)
+| llama ?B Q8_0 | ... | NPU | 999 | hpi-3720 | pp16 |  12535 ± 954 |
+hpi-3720: backend ran 90 Q8_0 mul_mat op(s), 0.011 GFLOP total
+```
+
+`Qcur-0` is the layer-0 query projection — a real transformer weight matmul routed to and computed
+by this backend. Set `GGML_NPU_VERBOSE=1` to get the per-run counts (the ggml info log itself is
+suppressed by `llama-bench`); without it the backend is silent. The model's weights are random, so
+the *output* is meaningless — this proves the offload path executes, not model quality.
+
 ## Cross-platform for now
 
 `hpi-3720/` is deliberately **standalone and cross-platform**: it builds on any C11 compiler with a
