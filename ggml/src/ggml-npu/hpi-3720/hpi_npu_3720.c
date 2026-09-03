@@ -99,6 +99,8 @@ typedef struct {
     void       *x_mem;               /* device-visible input  buffer (bound to g.arg[io.arg_x]) */
     void       *y_mem;               /* device-visible output buffer (bound to g.arg[io.arg_y]) */
     int         initialized;         /* AppendGraphInitialize has run for this graph */
+    ze_command_list_handle_t exec_list;  /* the AppendGraphExecute list — built once, re-submitted per call */
+    int         exec_ready;          /* exec_list is built + closed (re-runnable) */
     int         in_use;
 } npu3720_shape;
 
@@ -339,10 +341,16 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
         s->initialized = 1;
     }
 
-    ze_command_list_handle_t le;
-    if (npu_list_create(&p->d, &le) != 0) return HPI_EDEVICE;
-    if (npu_list_graph_exec(&s->g, le) != 0) return HPI_EDEVICE;
-    if (npu_queue_run(&p->d, p->q, le, UINT64_MAX) != 0) return HPI_EDEVICE;
+    // Build the AppendGraphExecute list ONCE per shape (it binds this shape's fixed x_mem/y_mem and is
+    // closed = re-runnable), then just re-submit it each call. Re-submitting re-executes the graph on
+    // the CURRENT x_mem contents (staged above) — this removes a zeCommandListCreate + AppendGraphExecute
+    // + Close from every op, the dominant per-op host overhead.
+    if (!s->exec_ready) {
+        if (npu_list_create(&p->d, &s->exec_list) != 0) return HPI_EDEVICE;
+        if (npu_list_graph_exec(&s->g, s->exec_list) != 0) return HPI_EDEVICE;
+        s->exec_ready = 1;
+    }
+    if (npu_queue_run(&p->d, p->q, s->exec_list, UINT64_MAX) != 0) return HPI_EDEVICE;
 
     /* Step 5: read back Y (device precision -> host f32). */
     st = stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N);
