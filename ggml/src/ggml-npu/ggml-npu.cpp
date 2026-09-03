@@ -160,24 +160,68 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     };
     struct ggml_context * gctx = ggml_init(ip);
     struct ggml_cgraph * batch = ggml_new_graph_custom(gctx, cgraph->size, false);
+
+    // Independent consecutive DPU mul_mats (q/k/v share the norm input; gate/up share theirs) are
+    // collected and submitted as ONE queue execute + sync (hpi_q8_0_gemm_batch), amortizing the per-op
+    // submit+sync. A DPU op is batchable when it is a single hpi GEMM (ne12==ne13==1). Both the DPU and
+    // CPU batches are flushed before any node that could read their outputs, preserving dependencies.
+    const int DPU_BATCH = 32;
+    hpi_q8_0_gemm        dpu_ops[DPU_BATCH];
+    struct ggml_tensor * dpu_dst[DPU_BATCH];
+    int n_dpu = 0;
+
+    auto flush_cpu = [&]() {
+        if (batch->n_nodes > 0) {
+            ggml_backend_graph_compute(ctx->cpu, batch);
+            ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
+            batch->n_nodes = 0;
+        }
+    };
+    auto flush_dpu = [&]() {
+        if (n_dpu > 0) {
+            hpi_q8_0_gemm_batch(ctx->hpi, dpu_ops, n_dpu);
+            for (int j = 0; j < n_dpu; j++) {
+                const hpi_q8_0_gemm & o = dpu_ops[j];
+                ctx->n_mul_mat++;
+                ctx->n_flop += 2ull * (uint64_t) o.M * (uint64_t) o.N * (uint64_t) o.K;
+                if (o.M > 1) ctx->n_m_gt1++;
+                if (o.M > ctx->max_m) ctx->max_m = o.M;
+            }
+            n_dpu = 0;
+        }
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (node->op == GGML_OP_NONE) continue;
-        if (ggml_backend_npu_dpu_cacheable(node)) {
-            if (batch->n_nodes > 0) {
-                ggml_backend_graph_compute(ctx->cpu, batch);
-                ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
-                batch->n_nodes = 0;
+
+        const bool batchable = ggml_backend_npu_dpu_cacheable(node) && node->ne[2] == 1 && node->ne[3] == 1;
+        if (batchable) {
+            flush_cpu();   // this DPU op may read a CPU-computed input -> ensure the CPU batch has run
+            bool dep = false;   // never batch an op that reads a not-yet-executed batched DPU output
+            for (int k = 0; k < n_dpu; k++) {
+                if (node->src[0] == dpu_dst[k] || node->src[1] == dpu_dst[k]) { dep = true; break; }
             }
-            ggml_backend_npu_mul_mat(ctx, node);
+            if (dep || n_dpu == DPU_BATCH) flush_dpu();
+            dpu_ops[n_dpu] = hpi_q8_0_gemm{
+                node->ne[1], node->src[0]->ne[1], node->src[0]->ne[0],
+                (const hpi_block_q8_0 *) node->src[0]->data,
+                (const float *)          node->src[1]->data,
+                (float *)                node->data,
+            };
+            dpu_dst[n_dpu] = node;
+            n_dpu++;
         } else {
-            batch->nodes[batch->n_nodes++] = node;
+            flush_dpu();   // this node may read a batched DPU output -> execute the batch first
+            if (ggml_backend_npu_dpu_cacheable(node)) {
+                ggml_backend_npu_mul_mat(ctx, node);   // cacheable but ne12/ne13>1 (multi-GEMM) -> run individually
+            } else {
+                batch->nodes[batch->n_nodes++] = node;
+            }
         }
     }
-    if (batch->n_nodes > 0) {
-        ggml_backend_graph_compute(ctx->cpu, batch);
-        ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
-    }
+    flush_dpu();
+    flush_cpu();
     ggml_free(gctx);
     return GGML_STATUS_SUCCESS;
 }

@@ -81,6 +81,12 @@ hpi_status  hpi_get_info(const hpi_device *dev, hpi_device_info *out);
 /* Run one Q8_0 GEMM. Validates shapes, then dispatches to the device's backend. */
 hpi_status  hpi_q8_0_gemm_run(hpi_device *dev, const hpi_q8_0_gemm *op);
 
+/* Run N INDEPENDENT Q8_0 GEMMs as a batch. On the NPU this stages all inputs, submits all N graphs in
+ * ONE queue execute + ONE synchronize, then reads all outputs — amortizing the per-op submit+sync that
+ * dominates small ops. The ops MUST be independent (none reads another's output). Validates each op;
+ * falls back to running them one at a time if the backend has no batch path. */
+hpi_status  hpi_q8_0_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n);
+
 /* Release a device. Safe on NULL. */
 void        hpi_close(hpi_device *dev);
 

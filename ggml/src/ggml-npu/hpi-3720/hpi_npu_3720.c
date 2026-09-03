@@ -293,68 +293,99 @@ static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
 /* ---------------------------------------------------------------------------------------------- *
  *  gemm() — one validated Q8_0 GEMM (shapes already checked by the dispatcher).
  * ---------------------------------------------------------------------------------------------- */
+/* Prepare a validated op: resolve/build its shape, stage X, ensure the graph is initialized and its
+ * (re-runnable) exec list built. Returns the ready shape — its exec_list can then be submitted — or
+ * NULL with *st set (HPI_UNAVAILABLE = no DPU blob, caller runs it on the CPU reference; else a real
+ * device error). Does NOT submit or read back, so many ops can be prepared then submitted as a batch. */
+static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_status *st) {
+    *st = HPI_OK;
+    npu3720_shape *s = shape_find(p, op);
+    if (!s) { s = shape_build(p, op, st); if (!s) return NULL; }
+
+    const npu_graph_arg *ax = &s->g.arg[s->io.arg_x];
+    /* Stage X into the device input buffer in the blob's precision. When this op uses fewer rows than
+     * the shared blob's M (an M=256 prefill blob serving op->M<256), zero the buffer first so the
+     * unused rows compute on zeros — their output rows are simply not read back. */
+    const size_t staged = (size_t)op->M * (size_t)op->K;
+    if (ax->elems > staged) memset(s->x_mem, 0, ax->bytes);
+    hpi_status cst = stage_in_f32(s->x_mem, ax->precision, op->x, staged);
+    if (cst != HPI_OK) { *st = cst; return NULL; }
+
+    /* AppendGraphInitialize once per shape (loads baked weights / builds descriptors). */
+    if (!s->initialized) {
+        ze_command_list_handle_t li;
+        if (npu_list_create(&p->d, &li) != 0 || npu_list_graph_init(&s->g, li) != 0 ||
+            npu_queue_run(&p->d, p->q, li, UINT64_MAX) != 0) { *st = HPI_EDEVICE; return NULL; }
+        s->initialized = 1;
+    }
+    /* Build the AppendGraphExecute list once (binds this shape's fixed x_mem/y_mem, closed = re-runnable). */
+    if (!s->exec_ready) {
+        if (npu_list_create(&p->d, &s->exec_list) != 0 || npu_list_graph_exec(&s->g, s->exec_list) != 0) {
+            *st = HPI_EDEVICE; return NULL;
+        }
+        s->exec_ready = 1;
+    }
+    return s;
+}
+
+/* Read back one prepared op's output (device precision -> host f32) after its graph has executed. */
+static void npu_finish(npu3720_shape *s, const hpi_q8_0_gemm *op) {
+    const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
+    stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N);
+}
+
+/* Uncached op -> the CPU reference (correct, not accelerated). Warns once. */
+static hpi_status npu_cpu_fallback(hpi_device *dev, const hpi_q8_0_gemm *op) {
+    static int said = 0;
+    if (!said) { said = 1; fprintf(stderr, "hpi-3720: NOTE — some Q8_0 mul_mats have no DPU blob yet "
+        "(uncached shape/tensor); those run on the CPU reference. Cached ops use the DPU.\n"); }
+    return hpi_backend_cpu()->gemm(dev, op);
+}
+
 static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
     if (!dev || !dev->priv || !op) return HPI_EINVAL;
     npu3720_priv *p = (npu3720_priv *)dev->priv;
-
-    hpi_status st = HPI_OK;
-    npu3720_shape *s = shape_find(p, op);
-    if (!s) {
-        s = shape_build(p, op, &st);
-        if (!s) {
-            /* No DPU blob for this op yet — either the silicon seam isn't built (probe/bring-up), or
-             * this specific shape/tensor is uncached (e.g. K != 2048 until the template generalizes,
-             * or a weight tensor build_blob_cache.py hasn't authored). Compute the correct result on
-             * the CPU reference and say so ONCE. The op is simply not accelerated yet — accelerated
-             * ops still use the DPU; we never fabricate or drop a result. */
-            if (st == HPI_UNAVAILABLE) {
-                static int said = 0;
-                if (!said) {
-                    said = 1;
-                    fprintf(stderr, "hpi-3720: NOTE — some Q8_0 mul_mats have no DPU blob yet "
-                                    "(uncached shape/tensor); those run on the CPU reference. Cached ops use the DPU.\n");
-                }
-                return hpi_backend_cpu()->gemm(dev, op);
-            }
-            return st;   /* a real device error (EDEVICE/ENOMEM) — surface it */
-        }
-    }
-
-    const npu_graph_arg *ax = &s->g.arg[s->io.arg_x];
-    const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
-
-    /* Stage activations X (host f32) into the device input buffer in the blob's precision. When this op
-     * uses fewer rows than the shared blob's M (a M=256 prefill blob serving op->M<256), zero the buffer
-     * first so the unused rows compute on zeros — their output rows are simply not read back. */
-    const size_t staged = (size_t)op->M * (size_t)op->K;
-    if (ax->elems > staged) memset(s->x_mem, 0, ax->bytes);
-    st = stage_in_f32(s->x_mem, ax->precision, op->x, staged);
-    if (st != HPI_OK) return st;
-
-    /* Step 4b: initialize the graph on the device once (loads baked weights / builds descriptors),
-     * then execute. AppendGraphInitialize + Execute is the VPU_CMD_INFERENCE_EXECUTE path. */
-    if (!s->initialized) {
-        ze_command_list_handle_t li;
-        if (npu_list_create(&p->d, &li) != 0) return HPI_EDEVICE;
-        if (npu_list_graph_init(&s->g, li) != 0) return HPI_EDEVICE;
-        if (npu_queue_run(&p->d, p->q, li, UINT64_MAX) != 0) return HPI_EDEVICE;  /* halt on DEVICE_LOST; caller must not loop-resubmit */
-        s->initialized = 1;
-    }
-
-    // Build the AppendGraphExecute list ONCE per shape (it binds this shape's fixed x_mem/y_mem and is
-    // closed = re-runnable), then just re-submit it each call. Re-submitting re-executes the graph on
-    // the CURRENT x_mem contents (staged above) — this removes a zeCommandListCreate + AppendGraphExecute
-    // + Close from every op, the dominant per-op host overhead.
-    if (!s->exec_ready) {
-        if (npu_list_create(&p->d, &s->exec_list) != 0) return HPI_EDEVICE;
-        if (npu_list_graph_exec(&s->g, s->exec_list) != 0) return HPI_EDEVICE;
-        s->exec_ready = 1;
-    }
+    hpi_status st;
+    npu3720_shape *s = npu_prepare(p, op, &st);
+    if (!s) return (st == HPI_UNAVAILABLE) ? npu_cpu_fallback(dev, op) : st;
     if (npu_queue_run(&p->d, p->q, s->exec_list, UINT64_MAX) != 0) return HPI_EDEVICE;
+    npu_finish(s, op);
+    return HPI_OK;
+}
 
-    /* Step 5: read back Y (device precision -> host f32). */
-    st = stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N);
-    return st;
+/* Batch of N INDEPENDENT ops: prepare all (stage inputs, one-time init), submit every graph in ONE
+ * zeCommandQueueExecuteCommandLists + ONE zeCommandQueueSynchronize (amortizes the per-op submit+sync
+ * that dominates small ops), then read all outputs. Uncached ops fall to the CPU reference in place. */
+#define NPU_GEMM_BATCH_MAX 32
+static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n) {
+    if (!dev || !dev->priv || !ops || n <= 0) return HPI_EINVAL;
+    npu3720_priv *p = (npu3720_priv *)dev->priv;
+    if (n > NPU_GEMM_BATCH_MAX) {                                   /* split oversized batches */
+        for (int off = 0; off < n; off += NPU_GEMM_BATCH_MAX) {
+            int m = (n - off < NPU_GEMM_BATCH_MAX) ? (n - off) : NPU_GEMM_BATCH_MAX;
+            hpi_status st = npu_gemm_batch(dev, ops + off, m);
+            if (st != HPI_OK) return st;
+        }
+        return HPI_OK;
+    }
+    npu3720_shape *sh[NPU_GEMM_BATCH_MAX];
+    ze_command_list_handle_t lists[NPU_GEMM_BATCH_MAX];
+    int nlist = 0;
+    for (int i = 0; i < n; i++) {                                  /* phase 1: prepare each op */
+        hpi_status st;
+        sh[i] = npu_prepare(p, &ops[i], &st);
+        if (!sh[i]) {
+            if (st == HPI_UNAVAILABLE) { npu_cpu_fallback(dev, &ops[i]); continue; }
+            return st;
+        }
+        lists[nlist++] = sh[i]->exec_list;
+    }
+    if (nlist > 0) {                                               /* phase 2: one submit + one sync for all */
+        if (p->z.zeCommandQueueExecuteCommandLists(p->q, (uint32_t)nlist, lists, NULL) != ZE_RESULT_SUCCESS) return HPI_EDEVICE;
+        if (p->z.zeCommandQueueSynchronize(p->q, UINT64_MAX) != ZE_RESULT_SUCCESS) return HPI_EDEVICE;
+    }
+    for (int i = 0; i < n; i++) if (sh[i]) npu_finish(sh[i], &ops[i]);   /* phase 3: read outputs */
+    return HPI_OK;
 }
 
 static const hpi_backend_ops g_npu_ops = {
@@ -364,6 +395,7 @@ static const hpi_backend_ops g_npu_ops = {
     .available = npu_available,
     .open = npu_open,
     .gemm = npu_gemm,
+    .gemm_batch = npu_gemm_batch,
     .close = npu_close,
 };
 

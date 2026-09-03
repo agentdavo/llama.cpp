@@ -26,6 +26,10 @@ struct hpi_backend_ops {
     hpi_status (*open)(hpi_device *dev);
     /* Run one validated Q8_0 GEMM (shapes already checked by the dispatcher). */
     hpi_status (*gemm)(hpi_device *dev, const hpi_q8_0_gemm *op);
+    /* (optional) Run N INDEPENDENT validated Q8_0 GEMMs, amortizing per-op cost (one queue submit +
+     * sync for all N on the NPU). NULL -> the dispatcher loops gemm(). Ops must not depend on each
+     * other (no op reads another's output) — the caller guarantees this. */
+    hpi_status (*gemm_batch)(hpi_device *dev, const hpi_q8_0_gemm *ops, int n);
     /* Free priv. */
     void       (*close)(hpi_device *dev);
 };

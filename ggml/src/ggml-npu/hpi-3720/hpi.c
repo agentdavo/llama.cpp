@@ -61,6 +61,23 @@ hpi_status hpi_q8_0_gemm_run(hpi_device *dev, const hpi_q8_0_gemm *op) {
     return dev->ops->gemm(dev, op);
 }
 
+hpi_status hpi_q8_0_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n) {
+    if (!dev || !dev->ops || !ops || n <= 0) return HPI_EINVAL;
+    for (int i = 0; i < n; i++) {
+        const hpi_q8_0_gemm *op = &ops[i];
+        if (!op->w || !op->x || !op->y)             return HPI_EINVAL;
+        if (op->M <= 0 || op->N <= 0 || op->K <= 0) return HPI_EINVAL;
+        if (op->K % HPI_QK8_0 != 0)                 return HPI_EINVAL;
+    }
+    if (dev->ops->gemm_batch) return dev->ops->gemm_batch(dev, ops, n);
+    if (!dev->ops->gemm)      return HPI_EINVAL;
+    for (int i = 0; i < n; i++) {              /* no batch path -> run one at a time */
+        hpi_status st = dev->ops->gemm(dev, &ops[i]);
+        if (st != HPI_OK) return st;
+    }
+    return HPI_OK;
+}
+
 void hpi_close(hpi_device *dev) {
     if (!dev) return;
     if (dev->ops && dev->ops->close) dev->ops->close(dev);
