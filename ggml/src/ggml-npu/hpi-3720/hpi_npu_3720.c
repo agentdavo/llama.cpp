@@ -36,7 +36,9 @@
  *  the full Level Zero layer (sections 3-5) is required, so NPU_NO_ZE must NOT be set.
  * ---------------------------------------------------------------------------------------------- */
 #define NPU_IMPLEMENTATION
+#ifndef NPU_NO_GDN            /* the CMake HW build also defines this; guard to avoid a redefine warning */
 #define NPU_NO_GDN
+#endif
 #include "npu.h"
 
 #include <stdlib.h>
@@ -120,15 +122,24 @@ typedef struct {
  *  available() / open() / close()
  * ---------------------------------------------------------------------------------------------- */
 
+/* Opt-in hardware bring-up probe. GGML_NPU_HW_PROBE=1 opens the REAL device (verifying we genuinely
+ * talk to the Windows NPU driver) even before the silicon compute seam is built; gemm then honestly
+ * delegates to the CPU reference (see npu_gemm). Off by default so normal runs keep the safe path. */
+static int npu_probe_open_requested(void) {
+    const char *e = getenv("GGML_NPU_HW_PROBE");
+    return e && e[0] && e[0] != '0';
+}
+
 /* Cheap capability report. MUST be 0 whenever a gemm cannot produce a correct result, because
  * HPI_BACKEND_AUTO selects this backend on a true here and the ggml layer asserts every gemm is
  * HPI_OK. So it is gated on the compute seam being real; only then does it matter whether a VPU is
- * physically present (probed at open). */
+ * physically present (probed at open). The probe opt-in is the one honest exception: it keeps gemm
+ * correct by falling back to the CPU reference, so advertising the device does not break the assert. */
 static int npu_available(void) {
 #if defined(HPI_NPU3720_BLOB_READY)
     return 1;
 #else
-    return 0;
+    return npu_probe_open_requested() ? 1 : 0;
 #endif
 }
 
@@ -150,6 +161,11 @@ static hpi_status npu_open(hpi_device *dev) {
      * explicit, coordinated benchmark, not the default compute path. */
     if (npu_queue_create(&p->d, 0, 0, &p->q) != 0) { free(p); return HPI_EDEVICE; }
     p->q_ok = 1;
+
+    /* Report the driver-reported identity once: this name/id can only come from the real Windows NPU
+     * driver via Level Zero — proof the open path is genuine, not a fake. */
+    fprintf(stderr, "hpi-3720: opened Intel NPU via Level Zero — \"%s\" id=0x%04x%s\n",
+            p->d.props.name, (unsigned)p->d.props.deviceId, p->d.graph ? " (graph-ext)" : "");
 
     dev->priv = p;
     return HPI_OK;
@@ -284,7 +300,26 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
 
     hpi_status st = HPI_OK;
     npu3720_shape *s = shape_find(p, op);
-    if (!s) { s = shape_build(p, op, &st); if (!s) return st; }
+    if (!s) {
+        s = shape_build(p, op, &st);
+        if (!s) {
+#if !defined(HPI_NPU3720_BLOB_READY)
+            /* Probe mode: the device is really open (driver verified) but the silicon Q8_0 blob seam
+             * (step 2) is not built, so shape_build returns HPI_UNAVAILABLE. Compute the correct
+             * result on the CPU reference and say so ONCE — never fabricate a silicon result. */
+            if (st == HPI_UNAVAILABLE && npu_probe_open_requested()) {
+                static int said = 0;
+                if (!said) {
+                    said = 1;
+                    fprintf(stderr, "hpi-3720: PROBE — NPU device is open on real hardware, but Q8_0 GEMM runs on the "
+                                    "CPU reference (silicon blob seam not built). Results are correct, not accelerated.\n");
+                }
+                return hpi_backend_cpu()->gemm(dev, op);
+            }
+#endif
+            return st;
+        }
+    }
 
     const npu_graph_arg *ax = &s->g.arg[s->io.arg_x];
     const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
