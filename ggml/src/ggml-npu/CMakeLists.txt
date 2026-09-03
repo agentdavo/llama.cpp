@@ -15,8 +15,23 @@ target_include_directories(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 option(GGML_NPU_HW "ggml-npu: compile the real VPU-3720 hardware path (Windows x64 + NPU + src/ toolkit)" OFF)
 if (GGML_NPU_HW)
-    target_compile_definitions(ggml-npu PRIVATE HPI_HAVE_NPU_3720)
-    # When implementing hpi_npu_3720.c, wire the src/ direct-access toolkit here, e.g.:
-    #   target_include_directories(ggml-npu PRIVATE ${NPU_SRC_DIR} ${LEVEL_ZERO_INCLUDE})
-    #   target_compile_definitions(ggml-npu PRIVATE NPU_NO_GDN)
+    # hpi_npu_3720.c owns the src/npu.h implementation (NPU_IMPLEMENTATION) and needs the full Level
+    # Zero layer, so it requires the direct-access toolkit and the L0 / NPU-extension headers on the
+    # include path. Point these at the repo's own copies (defaults assume the ggml tree lives under
+    # <npu>/llama.cpp, i.e. src/ and re/ref/ are two levels up); override on the cmake line if not.
+    set(NPU_SRC_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src"
+        CACHE PATH "Path to the src/ direct-access toolkit (contains npu.h)")
+    set(LEVEL_ZERO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../re/ref/level-zero/include"
+        CACHE PATH "Path to the Level Zero API headers")
+    set(NPU_EXT_INCLUDE   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../re/ref/npu-ext"
+        CACHE PATH "Path to the NPU (ze_graph) extension headers")
+
+    target_compile_definitions(ggml-npu PRIVATE HPI_HAVE_NPU_3720 NPU_NO_GDN)
+    target_include_directories(ggml-npu PRIVATE ${NPU_SRC_DIR} ${LEVEL_ZERO_INCLUDE} ${NPU_EXT_INCLUDE})
+
+    # The blob compute seam (hpi_npu3720_build_blob) is a separate TU implemented on the box; define
+    # HPI_NPU3720_BLOB_READY once it exists so npu_available() advertises the device. Until then the
+    # backend stays honest (reports unavailable, AUTO falls back to the CPU reference).
+    #   target_compile_definitions(ggml-npu PRIVATE HPI_NPU3720_BLOB_READY)
+    #   target_sources(ggml-npu PRIVATE ${NPU_BLOB_IMPL})
 endif()

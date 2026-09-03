@@ -18,7 +18,7 @@ behind this interface.
 | `hpi_backend.h` | Internal seam: the backend vtable (`hpi_backend_ops`) and the device struct |
 | `hpi.c` | Dispatcher: shape validation + backend selection (AUTO → NPU if usable, else CPU) |
 | `hpi_cpu.c` | Portable CPU reference backend — the golden reference the NPU path must match |
-| `hpi_npu_3720.c` | The real VPU-3720 backend — **stub**, guarded by `HPI_HAVE_NPU_3720` |
+| `hpi_npu_3720.c` | The real VPU-3720 backend — **plumbing wired, one compute seam open**, guarded by `HPI_HAVE_NPU_3720` |
 | `hpi_gguf.h` / `hpi_gguf.c` | Minimal read-only GGUF parser (enumerate tensors, reach Q8_0 bytes) |
 | `gguf_q8_0_offload.c` | Tool: point the offload at a real `.gguf` (`--list` / `--tensor` / `--rows` / `--check`) |
 | `test/test_q8_0_gemm.c` | Deterministic GEMM self-test vs. an independent double-precision reference |
@@ -73,15 +73,24 @@ is ~1e-4.
 - **No unverified hardware claims.** `hpi_npu_3720.c` reports `HPI_UNAVAILABLE` until a real Q8_0
   schedule runs on silicon — it never fakes a result.
 
-## Implementing the NPU-3720 path (next)
+## Implementing the NPU-3720 path
 
-Build with `-DHPI3720_HAVE_NPU=ON` on Windows x64 with the NPU present, wire the `src/` toolkit
-includes in `CMakeLists.txt`, then fill in `hpi_npu_3720.c` following the verified `src/` ladder:
+The plumbing is now written in `hpi_npu_3720.c` (guarded by `HPI_HAVE_NPU_3720`). Building with
+`-DGGML_NPU_HW=ON` (or `-DHPI3720_HAVE_NPU=ON` for the standalone lib) auto-wires the `src/` toolkit
+and the Level Zero / NPU-extension include paths (override `NPU_SRC_DIR`, `LEVEL_ZERO_INCLUDE`,
+`NPU_EXT_INCLUDE` on the cmake line if your checkout differs). Of the verified `src/` ladder:
 
-1. `npu_ze_load` + `npu_dev_open` — select the VPU via Level Zero (`src/ze_npu*.c`).
-2. Build/load a **Q8_0 GEMM schedule blob** for the NCE/DPU MAC array (the `re/emit_*.py` analog).
-   *Blocked on the NCE descriptor layout — see the outer CLAUDE.md "long game".*
-3. `npu_mem_alloc` NPU-visible buffers; stage `W`, `X` in, `Y` out.
-4. `npu_graph_create` → init → exec (`VPU_CMD_INFERENCE_EXECUTE`), then read back `Y`.
+1. `npu_ze_load` + `npu_dev_open` — **done** (device + context + graph table, cached in `open()`).
+2. Build/load a **Q8_0 GEMM schedule blob** for the shape — **the one open seam**,
+   `hpi_npu3720_build_blob()`. *Blocked on the NCE descriptor layout / an OpenVINO compile — see the
+   outer CLAUDE.md "long game" and `re/FINDINGS.md` (per-channel dequant compiles; per-block does not).*
+3. `npu_mem_alloc` NPU-visible buffers; stage `X` in, `Y` out — **done** (per-shape cache, f32↔fp16).
+4. `npu_graph_create` → init → exec (`VPU_CMD_INFERENCE_EXECUTE`) → read back `Y` — **done**.
 
-Until steps 2–4 are real, flip nothing to "available": the CPU reference is the shipping path.
+`npu_available()` is gated by `HPI_NPU3720_BLOB_READY` (the same macro that supplies step 2), so until
+a real blob exists the backend reports **unavailable** and `HPI_BACKEND_AUTO` falls back to the CPU
+reference — it never fakes a result. On the box: implement the seam as a separate TU, add it to the
+build, define `HPI_NPU3720_BLOB_READY`, and flip nothing else.
+
+> The `HPI_HAVE_NPU_3720` branch has not been compiled in CI (it needs the Windows Level Zero stack);
+> it is a reviewed, `-Wall -Wextra -Wconversion`-clean scaffold. Compile it on the box first.

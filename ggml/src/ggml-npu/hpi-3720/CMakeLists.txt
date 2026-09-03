@@ -26,11 +26,19 @@ add_library(hpi3720 STATIC
 target_include_directories(hpi3720 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if (HPI3720_HAVE_NPU)
-    target_compile_definitions(hpi3720 PRIVATE HPI_HAVE_NPU_3720)
-    # The real path pulls in the src/ direct-access toolkit (npu.h, Level Zero). Wire those includes
-    # here when implementing hpi_npu_3720.c, e.g.:
-    #   target_include_directories(hpi3720 PRIVATE ${NPU_SRC_DIR} ${LEVEL_ZERO_INCLUDE})
-    #   target_compile_definitions(hpi3720 PRIVATE NPU_NO_GDN)
+    # hpi_npu_3720.c owns the src/npu.h implementation and needs the full Level Zero layer. Default
+    # the include paths to the repo's own copies (this dir lives five levels below <npu>); override
+    # on the cmake line for an out-of-tree checkout.
+    set(NPU_SRC_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../src"
+        CACHE PATH "Path to the src/ direct-access toolkit (contains npu.h)")
+    set(LEVEL_ZERO_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../re/ref/level-zero/include"
+        CACHE PATH "Path to the Level Zero API headers")
+    set(NPU_EXT_INCLUDE   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../re/ref/npu-ext"
+        CACHE PATH "Path to the NPU (ze_graph) extension headers")
+
+    target_compile_definitions(hpi3720 PRIVATE HPI_HAVE_NPU_3720 NPU_NO_GDN)
+    target_include_directories(hpi3720 PRIVATE ${NPU_SRC_DIR} ${LEVEL_ZERO_INCLUDE} ${NPU_EXT_INCLUDE})
+    # Define HPI_NPU3720_BLOB_READY and add the blob-seam TU once the compute path exists on the box.
 endif()
 
 # Warnings-as-errors on the pure code (outer CLAUDE.md rule 1), where the compiler supports it.
