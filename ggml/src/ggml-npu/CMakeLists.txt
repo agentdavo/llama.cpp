@@ -9,6 +9,7 @@ ggml_add_backend_library(ggml-npu
                          hpi-3720/hpi.c
                          hpi-3720/hpi_cpu.c
                          hpi-3720/hpi_npu_3720.c
+                         hpi-3720/hpi_npu3720_blob.c
                         )
 
 target_include_directories(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -26,7 +27,11 @@ if (GGML_NPU_HW)
     set(NPU_EXT_INCLUDE   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../re/ref/npu-ext"
         CACHE PATH "Path to the NPU (ze_graph) extension headers")
 
-    target_compile_definitions(ggml-npu PRIVATE HPI_HAVE_NPU_3720 NPU_NO_GDN)
+    # HPI_HAVE_NPU_3720: the real Level-Zero device path (hpi_npu_3720.c). NPU_NO_GDN: hpi_npu_3720.c
+    # drops the AVX GDN host math from npu.h. HPI_NPU3720_BLOB_READY: the compute seam is real — the
+    # provider TU hpi_npu3720_blob.c loads per-tensor blobs precompiled by re/build_blob_cache.py
+    # (set NPU_BLOB_CACHE at run time to the cache dir), so npu_available() advertises the device.
+    target_compile_definitions(ggml-npu PRIVATE HPI_HAVE_NPU_3720 HPI_NPU3720_BLOB_READY NPU_NO_GDN)
     target_include_directories(ggml-npu PRIVATE ${NPU_SRC_DIR} ${LEVEL_ZERO_INCLUDE} ${NPU_EXT_INCLUDE})
 
     # The blob compute seam (hpi_npu3720_build_blob) is a separate TU implemented on the box; define

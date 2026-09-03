@@ -73,18 +73,11 @@
  *  On success: *blob = malloc'd native blob (caller frees), *blob_len its size, *io filled.
  *  Until implemented: returns HPI_UNAVAILABLE.
  * ---------------------------------------------------------------------------------------------- */
-typedef struct {
-    int arg_x;   /* graph argument index that receives activations X (>= 0) */
-    int arg_y;   /* graph argument index that produces output Y (>= 0)      */
-    int arg_w;   /* weights input index, or < 0 if weights are baked into the blob */
-} hpi_npu3720_blob_io;
+#include "hpi_npu3720_blob.h"   /* hpi_npu3720_blob_io + (when a provider is compiled in) build_blob's prototype */
 
-#if defined(HPI_NPU3720_BLOB_READY)
-/* Provided by the hardware-side implementation (a separate TU compiled on the box). */
-extern hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
-                                         uint8_t **blob, size_t *blob_len,
-                                         hpi_npu3720_blob_io *io);
-#else
+#if !defined(HPI_NPU3720_BLOB_READY)
+/* No provider TU (hpi_npu3720_blob.c) compiled in: the seam is unavailable, so the backend reports
+ * unavailable and HPI_BACKEND_AUTO falls back to the CPU reference. */
 static hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
                                          uint8_t **blob, size_t *blob_len,
                                          hpi_npu3720_blob_io *io) {
@@ -303,21 +296,21 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
     if (!s) {
         s = shape_build(p, op, &st);
         if (!s) {
-#if !defined(HPI_NPU3720_BLOB_READY)
-            /* Probe mode: the device is really open (driver verified) but the silicon Q8_0 blob seam
-             * (step 2) is not built, so shape_build returns HPI_UNAVAILABLE. Compute the correct
-             * result on the CPU reference and say so ONCE — never fabricate a silicon result. */
-            if (st == HPI_UNAVAILABLE && npu_probe_open_requested()) {
+            /* No DPU blob for this op yet — either the silicon seam isn't built (probe/bring-up), or
+             * this specific shape/tensor is uncached (e.g. K != 2048 until the template generalizes,
+             * or a weight tensor build_blob_cache.py hasn't authored). Compute the correct result on
+             * the CPU reference and say so ONCE. The op is simply not accelerated yet — accelerated
+             * ops still use the DPU; we never fabricate or drop a result. */
+            if (st == HPI_UNAVAILABLE) {
                 static int said = 0;
                 if (!said) {
                     said = 1;
-                    fprintf(stderr, "hpi-3720: PROBE — NPU device is open on real hardware, but Q8_0 GEMM runs on the "
-                                    "CPU reference (silicon blob seam not built). Results are correct, not accelerated.\n");
+                    fprintf(stderr, "hpi-3720: NOTE — some Q8_0 mul_mats have no DPU blob yet "
+                                    "(uncached shape/tensor); those run on the CPU reference. Cached ops use the DPU.\n");
                 }
                 return hpi_backend_cpu()->gemm(dev, op);
             }
-#endif
-            return st;
+            return st;   /* a real device error (EDEVICE/ENOMEM) — surface it */
         }
     }
 
