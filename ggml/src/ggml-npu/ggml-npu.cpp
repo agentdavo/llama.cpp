@@ -57,6 +57,24 @@ static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
     return false;
 }
 
+// MoE expert matmul: true when a MUL_MAT_ID's experts are the Q8_0 shape our DPU path handles. The
+// experts are a 3D stack [K, N, n_expert]; each routed (token, expert) is one M=1 Q8_0 gemm (below).
+// Sub-8-bit experts (Q4_K/IQ4_NL/... — every cached MoE today) return false here and stay on the CPU
+// passthrough, correct but unaccelerated, until the native-4-bit stream slab lands (Path B).
+static bool ggml_backend_npu_mmid_cacheable(const struct ggml_tensor * op) {
+    if (op->op != GGML_OP_MUL_MAT_ID) return false;
+    const struct ggml_tensor * src0 = op->src[0];   // experts [K, N, n_expert]
+    const struct ggml_tensor * src1 = op->src[1];   // activations [K, ne11, n_tokens]
+    const struct ggml_tensor * ids  = op->src[2];   // expert ids [n_expert_used, n_tokens]
+    if (!src0 || !src1 || !ids) return false;
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    if (ids->type != GGML_TYPE_I32) return false;
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
+    const int64_t K = src0->ne[0], N = src0->ne[1];
+    if (N % 256 != 0 || K % 32 != 0) return false;
+    return true;                                     // per-expert rows are M=1 (decode blob, any K)
+}
+
 // --- the offloaded op: Q8_0 mul_mat through the HPI --------------------------------------------- //
 
 static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml_tensor * dst) {
@@ -123,6 +141,58 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
     }
 }
 
+// --- MoE experts: MUL_MAT_ID as one M=1 Q8_0 gemm per routed (token, expert) --------------------- //
+
+static void ggml_backend_npu_mul_mat_id(ggml_backend_npu_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0]; // experts, Q8_0: [K=ne00, N=ne01, n_expert=ne02]
+    const struct ggml_tensor * src1 = dst->src[1]; // activations, F32: [K=ne10, ne11, n_tokens=ne12]
+    const struct ggml_tensor * ids  = dst->src[2]; // expert ids, I32: [n_expert_used=ne0, n_tokens=ne1]
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(ne00 == ne10);                       // K
+    GGML_ASSERT(ne0  == ne01);                       // N (dst->ne[0])
+    GGML_ASSERT(nb00 == ggml_type_size(GGML_TYPE_Q8_0)); // expert rows block-contiguous
+    GGML_ASSERT(nb10 == sizeof(float));                  // src1 contiguous rows
+
+    const int64_t K = ne00, N = ne01, n_expert = ne02;
+    const int64_t n_ids = ids->ne[0];                // experts used per token
+    const int64_t n_tok = ids->ne[1];                // tokens
+
+    // One submit per token: its n_ids selected experts are INDEPENDENT M=1 gemms (distinct expert
+    // matrices), so they batch into one queue execute+sync. Indexing mirrors ggml-cpu's reference
+    // (ggml_compute_forward_mul_mat_id) exactly: expert e = ids[id, iid1]; its [K,N] matrix at
+    // src0 + e*nb02 applies to src1 row (i11 = id % ne11, iid1) -> dst column (id, iid1).
+    enum { NPU_MMID_MAX = 160 };                     // n_expert_used is small (<=16 in practice)
+    hpi_q8_0_gemm ops[NPU_MMID_MAX];
+    for (int64_t iid1 = 0; iid1 < n_tok; iid1++) {
+        int nops = 0;
+        for (int64_t id = 0; id < n_ids; id++) {
+            const int32_t e = *(const int32_t *)((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+            GGML_ASSERT(e >= 0 && e < n_expert);
+            const int64_t i11 = id % ne11;
+            const hpi_block_q8_0 * w = (const hpi_block_q8_0 *)((const char *) src0->data + e*nb02);
+            const float          * x = (const float *)         ((const char *) src1->data + i11*nb11 + iid1*nb12);
+            float                * y = (float *)               ((      char *) dst ->data + id*nb1  + iid1*nb2);
+            GGML_ASSERT(nops < NPU_MMID_MAX);
+            ops[nops++] = hpi_q8_0_gemm{ 1, N, K, w, x, y };
+        }
+        if (nops == 0) continue;
+        const hpi_status st = hpi_q8_0_gemm_batch(ctx->hpi, ops, nops);
+        if (st != HPI_OK) {
+            GGML_LOG_ERROR("hpi-3720: MUL_MAT_ID batch failed st=%d (%s) op='%s' experts=%d N=%lld K=%lld\n",
+                           (int)st, hpi_status_str(st), dst->name, nops, (long long)N, (long long)K);
+        }
+        GGML_ASSERT(st == HPI_OK);
+        ctx->n_mul_mat += (uint64_t) nops;
+        ctx->n_flop    += 2ull * (uint64_t) nops * (uint64_t) N * (uint64_t) K;
+    }
+}
+
 static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_npu_context * ctx = (ggml_backend_npu_context *) backend->context;
 
@@ -134,6 +204,9 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
             switch (node->op) {
                 case GGML_OP_MUL_MAT:
                     ggml_backend_npu_mul_mat(ctx, node);
+                    break;
+                case GGML_OP_MUL_MAT_ID:
+                    ggml_backend_npu_mul_mat_id(ctx, node);
                     break;
                 case GGML_OP_NONE:
                 case GGML_OP_RESHAPE:
@@ -215,8 +288,11 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
             flush_dpu();   // this node may read a batched DPU output -> execute the batch first
             if (ggml_backend_npu_dpu_cacheable(node)) {
                 ggml_backend_npu_mul_mat(ctx, node);   // cacheable but ne12/ne13>1 (multi-GEMM) -> run individually
+            } else if (ggml_backend_npu_mmid_cacheable(node)) {
+                flush_cpu();                           // experts read CPU-computed activations -> flush first
+                ggml_backend_npu_mul_mat_id(ctx, node);   // MoE experts on the DPU (one batched submit per token)
             } else {
-                batch->nodes[batch->n_nodes++] = node;
+                batch->nodes[batch->n_nodes++] = node;   // everything else (incl. sub-8-bit experts) -> CPU passthrough
             }
         }
     }
@@ -384,6 +460,8 @@ static bool ggml_backend_npu_device_supports_op(ggml_backend_dev_t dev, const st
                    ggml_is_contiguous(src1)     &&
                    (src0->ne[0] % 32 == 0);     // Q8_0 block-aligned K (always true, guarded anyway)
         }
+        case GGML_OP_MUL_MAT_ID:
+            return ggml_backend_npu_mmid_cacheable(op);   // Q8_0 MoE experts (sub-8-bit -> not us, stays on CPU)
         default:
             return false;
     }
