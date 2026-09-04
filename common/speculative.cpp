@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -29,6 +30,14 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+bool common_speculative_trace_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MTP_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
@@ -1435,9 +1444,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        COMMON_SPEC_TRACE("event=mtp_init n_seq=%u n_embd=%d heads=%d shared_kv=%d chain_heads=%d n_max=%d n_min=%d p_min=%.6f row_bytes=%zu",
+                n_seq, n_embd, n_mtp_layers, (int) is_mem_shared, (int) chain_heads,
+                this->params.n_max, this->params.n_min, this->params.p_min, (size_t) n_embd * sizeof(float));
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        COMMON_SPEC_TRACE("event=mtp_destroy n_seq=%u", n_seq);
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1465,6 +1478,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+
+        COMMON_SPEC_TRACE("event=mtp_begin seq=%d prompt_tokens=%d draft_pos_max=%d", seq_id, N, pos_max);
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -1555,7 +1570,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                COMMON_SPEC_TRACE("event=mtp_catchup_begin head=%d rows=%d pos0=%d hidden_bytes=%zu", head, batch.n_tokens, batch.pos[0], row_bytes * batch.n_tokens);
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                COMMON_SPEC_TRACE("event=mtp_catchup_return head=%d rc=%d", head, rc);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1588,6 +1605,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            COMMON_SPEC_TRACE("event=mtp_hidden_capture seq=%d rows=%d pos0=%d pending_row=%d bytes=%zu",
+                    seq_id, n_rows, batch_in.pos[i_batch_beg[seq_id]], n_rows - 1, row_bytes * n_rows);
         }
 
         return true;
@@ -1615,6 +1634,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            COMMON_SPEC_TRACE("event=mtp_draft_begin seq=%d pos=%d anchor=%d requested_max=%d", seq_id, dp.n_past, dp.id_last, dp.n_max);
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
@@ -1644,7 +1664,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            COMMON_SPEC_TRACE("event=mtp_decode_begin step=%d rows=%d pos0=%d", i, batch.n_tokens, batch.pos[0]);
             int ret = llama_decode(ctx_dft, batch);
+            COMMON_SPEC_TRACE("event=mtp_decode_return step=%d rc=%d", i, ret);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
@@ -1675,6 +1697,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
+
+                COMMON_SPEC_TRACE("event=mtp_candidate seq=%d step=%d token=%d topk_p=%.8f keep=%d",
+                        seq_id, i, id, cur_p->data[0].p, (int) (cur_p->data[0].p >= params.p_min));
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1741,6 +1766,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            COMMON_SPEC_TRACE("event=mtp_draft_end seq=%d proposed=%zu", seq_id, dp.result->size());
         }
     }
 
@@ -1757,6 +1783,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        COMMON_SPEC_TRACE("event=mtp_hidden_accept seq=%d accepted=%u available_rows=%d selected_row=%d bytes=%zu",
+                seq_id, (unsigned) n_accepted, n_rows, i_h, row_bytes);
     }
 };
 

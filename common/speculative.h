@@ -2,6 +2,18 @@
 
 #include "llama.h"
 #include "common.h"
+#include "log.h"
+
+#include <cinttypes>
+
+// Opt-in host timeline. Set LLAMA_MTP_TRACE=1 before process startup.
+bool common_speculative_trace_enabled();
+#define COMMON_SPEC_TRACE(fmt, ...) \
+    do { \
+        if (common_speculative_trace_enabled()) { \
+            LOG_INF("MTP_TRACE t_us=%" PRId64 " " fmt "\n", ggml_time_us(), __VA_ARGS__); \
+        } \
+    } while (0)
 
 struct common_speculative;
 

@@ -1145,6 +1145,7 @@ private:
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+                COMMON_SPEC_TRACE("event=draft_context_ready target=%s draft=%s", params_base.model.path.c_str(), params_dft.model.path.c_str());
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1270,6 +1271,10 @@ private:
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
+
+        COMMON_SPEC_TRACE("event=spec_ready active=%d target_rm=%d draft_rm=%d target_rs=%u draft_rs=%u",
+                (int) (spec != nullptr), (int) ctx_tgt_seq_rm_type, (int) ctx_dft_seq_rm_type,
+                llama_n_rs_seq(ctx_tgt), ctx_dft ? llama_n_rs_seq(ctx_dft) : 0);
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
@@ -1831,6 +1836,7 @@ private:
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
+        COMMON_SPEC_TRACE("event=output_token seq=%d token=%d n_gen=%" PRIu64, slot.id, result.tok, slot.stats.n_gen);
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -3049,6 +3055,8 @@ private:
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
+                COMMON_SPEC_TRACE("event=draft_trim seq=%d from=%d pos_max=%d proposed=%zu",
+                        slot.id, ckpt.pos_max + 1, llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id), draft.size());
             }
 
             if (!draft.empty()) {
@@ -3663,10 +3671,13 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            COMMON_SPEC_TRACE("event=target_decode_begin rows=%d pos0=%d seq0=%d has_output=%d",
+                    batch_view.n_tokens, batch_view.pos[0], batch_view.seq_id[0][0], (int) has_output);
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            COMMON_SPEC_TRACE("event=target_decode_end rows=%d rc=%d synchronized=%d", batch_view.n_tokens, ret, (int) (ret == 0 && has_output));
         });
 
         if (ret != 0) {
@@ -3911,6 +3922,9 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
 
+                COMMON_SPEC_TRACE("event=verify_decision seq=%d proposed=%zu accepted=%zu rollback=%u checkpoint=%d replay=%d target_rs=%u",
+                        slot.id, n_draft, accepted.size() - 1, n_rollback, (int) use_ckpt_tgt, (int) slot.spec_is_replay, llama_n_rs_seq(ctx_tgt));
+
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
@@ -3936,6 +3950,9 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        COMMON_SPEC_TRACE("event=checkpoint_restored seq=%d target_pos_max=%d draft_pos_max=%d replay_tokens=%zu",
+                                slot.id, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id),
+                                ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1, slot.spec_draft.size());
 
                         return;
                     }
@@ -3980,6 +3997,12 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+            COMMON_SPEC_TRACE("event=verify_commit seq=%d accepted=%zu ids=%zu trim_from=%d target_pos_max=%d draft_pos_max=%d total_accepted=%" PRIu64 " total_proposed=%" PRIu64,
+                    slot.id, n_accepted, ids.size(), slot.prompt.tokens.pos_next(),
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id),
+                    ctx_dft ? llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot.id) : -1,
+                    slot.stats.n_draft_accepted, slot.stats.n_draft_tokens);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
