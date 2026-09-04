@@ -13,6 +13,8 @@ typedef struct {
     int arg_x;   /* graph argument index that receives activations X (>= 0)      */
     int arg_y;   /* graph argument index that produces output Y (>= 0)           */
     int arg_w;   /* weights input index, or < 0 if weights are baked into the blob */
+    uint8_t *weight_image;       /* optional malloc-owned immutable image; caller frees */
+    size_t weight_image_bytes;
 } hpi_npu3720_blob_io;
 
 /* Produce (or fetch from a cache) a native VPU-3720 blob computing Y[MxN] = X[MxK] . dequant(W)^T for
