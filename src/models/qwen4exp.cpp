@@ -999,7 +999,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
+    // n_kv_max bounds the number of finite (non-masked) entries per mask row: after the top_k unmask
+    // each query attends to at most top_k->ne[0] cells, so that is the tight bound. Passing it (instead
+    // of 0 = unbounded) lets a flash-attention backend that honours the hint cap KV work to the top_k
+    // budget rather than the whole cache - the sparse-attention win on a bytes-bound target. Matches the
+    // shared llm_graph_context::build_attn sparse path (and glm-dsa/deepseek32). No effect off flash-attn
+    // or on backends that ignore the hint (e.g. the CPU kernel), so it is correctness-preserving there.
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
