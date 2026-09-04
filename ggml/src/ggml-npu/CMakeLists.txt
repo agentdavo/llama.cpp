@@ -33,6 +33,8 @@ if (GGML_NPU_HW)
     # (set NPU_BLOB_CACHE at run time to the cache dir), so npu_available() advertises the device.
     target_compile_definitions(ggml-npu PRIVATE HPI_HAVE_NPU_3720 HPI_NPU3720_BLOB_READY NPU_NO_GDN)
     target_include_directories(ggml-npu PRIVATE ${NPU_SRC_DIR} ${LEVEL_ZERO_INCLUDE} ${NPU_EXT_INCLUDE})
+    target_sources(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor/hash/sha256/sha256.c)
+    target_include_directories(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor/hash)
 
     # The blob compute seam (hpi_npu3720_build_blob) is a separate TU implemented on the box; define
     # HPI_NPU3720_BLOB_READY once it exists so npu_available() advertises the device. Until then the

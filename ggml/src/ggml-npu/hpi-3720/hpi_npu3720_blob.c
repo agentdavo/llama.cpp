@@ -1,105 +1,111 @@
-/*
- * hpi_npu3720_blob.c — the compute seam (step 2), the "provider" TU. Implements hpi_npu3720_build_blob
- * by loading a per-tensor blob precompiled offline by re/build_blob_cache.py.
- *
- * Contract: weights are FIXED across all decode steps, so we don't author at runtime — an offline pass
- * authored one baked, LINEAR-slab (SWZ=0) M=1 DPU matmul blob per Q8_0 weight tensor, keyed by an
- * FNV-1a-64 of the tensor's RAW Q8_0 bytes (exactly what ggml mmaps as op->w). Here we hash op->w the
- * same way and load <NPU_BLOB_CACHE>/<key>.blob. Baked weights -> arg_w<0, only input 'x', only output
- * 'Relu_5' (arg_y). If no blob is cached for this op, return HPI_UNAVAILABLE so npu_gemm falls back to
- * the CPU reference (the shape/tensor just isn't accelerated yet — never a wrong result).
- *
- * The hash MUST match re/build_blob_cache.py fnv1a64_np exactly: fnv1a64(head[:H]) ^ (fnv1a64(tail[-H:])
- * * GOLDEN) ^ len, with H = min(len, 4096), GOLDEN = 0x9E3779B97F4A7C15, all in wrapping uint64.
+/* Versioned baked-weight cache. See re/blob_cache_format.py for the wire format.
+ * Full source SHA256 is checked on cold lookup, payload SHA256 before graph load.
+ * Weights and cache directory must remain fixed for the HPI device lifetime.
+ * Missing, stale or damaged entries return HPI_UNAVAILABLE for caller fallback.
  */
-#include "hpi_backend.h"   /* pulls hpi.h; brings HPI_HAVE_NPU_3720 into scope via the build defs */
-
-#if defined(HPI_HAVE_NPU_3720)   /* provider only in the hardware build (paired with HPI_NPU3720_BLOB_READY) */
-
+#include "hpi_backend.h"
+#if defined(HPI_HAVE_NPU_3720)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "hpi_npu3720_blob.h"
-#include "hpi_q8_0.h"    /* hpi_block_q8_0, HPI_QK8_0 */
+#include "hpi_q8_0.h"
+#include "sha256/sha256.h"
 
-#define NPU_FNV64_OFFSET 0xcbf29ce484222325ULL
-#define NPU_FNV64_PRIME  0x100000001b3ULL
-#define NPU_GOLDEN64     0x9E3779B97F4A7C15ULL
-#define NPU_HASH_WINDOW  4096u
+#define NPU_CACHE_HEADER 128u
+#define NPU_CACHE_VERSION 2u
 
-static uint64_t npu_fnv1a64(const unsigned char *b, size_t n) {
-    uint64_t h = NPU_FNV64_OFFSET;
-    for (size_t i = 0; i < n; i++) h = (h ^ (uint64_t)b[i]) * NPU_FNV64_PRIME;   /* wraps in uint64 */
-    return h;
+static uint32_t read32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* Content key over the raw weight bytes — head window ^ (tail window * golden) ^ length. */
-static uint64_t npu_weight_key(const unsigned char *a, size_t n) {
-    size_t hw = n < NPU_HASH_WINDOW ? n : NPU_HASH_WINDOW;
-    uint64_t hh = npu_fnv1a64(a, hw);
-    uint64_t tt = npu_fnv1a64(a + (n - hw), hw);
-    return hh ^ (tt * NPU_GOLDEN64) ^ (uint64_t)n;
+static uint64_t read64(const unsigned char *p) {
+    return (uint64_t)read32(p) | ((uint64_t)read32(p + 4) << 32);
 }
 
-/* Read an entire file into a malloc'd buffer. Returns 0 on success (*buf owned by caller), -1 otherwise. */
-static int npu_read_file(const char *path, unsigned char **buf, size_t *len) {
+static void digest_hex(const unsigned char digest[32], char hex[65]) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 15];
+    }
+    hex[64] = 0;
+}
+
+static int read_file(const char *path, unsigned char **buffer, size_t *length) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
-    long sz = ftell(f);
-    if (sz <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
-    unsigned char *p = (unsigned char *)malloc((size_t)sz);
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return -1; }
+    const long bytes = ftell(f);
+    if (bytes < (long)(NPU_CACHE_HEADER + 4u) || fseek(f, 0, SEEK_SET)) {
+        fclose(f); return -1;
+    }
+    unsigned char *p = (unsigned char *)malloc((size_t)bytes);
     if (!p) { fclose(f); return -1; }
-    size_t got = fread(p, 1, (size_t)sz, f);
-    fclose(f);
-    if (got != (size_t)sz) { free(p); return -1; }
-    *buf = p; *len = (size_t)sz;
+    const size_t got = fread(p, 1, (size_t)bytes, f);
+    const int closed = fclose(f);
+    if (got != (size_t)bytes || closed) { free(p); return -1; }
+    *buffer = p; *length = (size_t)bytes;
     return 0;
 }
 
 hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
-                                  uint8_t **blob, size_t *blob_len,
-                                  hpi_npu3720_blob_io *io) {
-    if (!op || !blob || !blob_len || !io) return HPI_EINVAL;
-
-    /* Pick the blob variant by batch size M. M=1 -> the decode blob "<key>.blob" (emit_m1mm). 2..256 ->
-     * the prefill blob "<key>.m256.blob" (emit_stream M=256, no-ReLU); npu_gemm pads op->M rows into its
-     * 256-row input. M>256 has no blob (run with -ub<=256 so prefill ubatches are <=256) -> CPU reference. */
-    const char *suffix;
-    if (op->M == 1)        suffix = "";
-    else if (op->M <= 256) suffix = ".m256";
-    else                   return HPI_UNAVAILABLE;
-
+    uint8_t **blob, size_t *blob_len, hpi_npu3720_blob_io *io) {
+    if (!blob || !blob_len || !io) return HPI_EINVAL;
+    *blob = NULL; *blob_len = 0;
+    if (!op || !op->w || op->M <= 0 || op->N <= 0 || op->K <= 0 ||
+        op->K % HPI_QK8_0) return HPI_EINVAL;
+    if (op->M > 256) return HPI_UNAVAILABLE;
     const char *cache = getenv("NPU_BLOB_CACHE");
-    if (!cache || !cache[0]) return HPI_UNAVAILABLE;   /* no cache configured -> CPU reference */
-
-    /* Raw weight byte span, exactly as offline: N rows * (K/QK8_0) blocks * sizeof(block). */
-    const size_t nblocks = (size_t)op->N * ((size_t)op->K / (size_t)HPI_QK8_0);
-    const size_t wbytes  = nblocks * sizeof(hpi_block_q8_0);
-    const uint64_t key   = npu_weight_key((const unsigned char *)op->w, wbytes);
-
+    if (!cache || !cache[0]) return HPI_UNAVAILABLE;
     char path[1024];
-    int n = snprintf(path, sizeof path, "%s/%016llx%s.blob", cache, (unsigned long long)key, suffix);
-    if (n <= 0 || (size_t)n >= sizeof path) return HPI_UNAVAILABLE;
-
-    unsigned char *buf = NULL; size_t len = 0;
-    if (npu_read_file(path, &buf, &len) != 0) {                        /* not cached -> CPU reference */
-        if (getenv("GGML_NPU_VERBOSE")) { static int nmiss = 0; if (nmiss++ < 10)
-            fprintf(stderr, "hpi-3720: blob MISS key=%016llx M=%lld N=%lld K=%lld wbytes=%zu w0=%02x%02x%02x%02x\n",
-                    (unsigned long long)key, (long long)op->M, (long long)op->N, (long long)op->K, wbytes,
-                    ((const unsigned char*)op->w)[0], ((const unsigned char*)op->w)[1],
-                    ((const unsigned char*)op->w)[2], ((const unsigned char*)op->w)[3]); }
-        return HPI_UNAVAILABLE;
+    const int marker_name = snprintf(path, sizeof path, "%s/cache-v2.ready", cache);
+    if (marker_name <= 0 || (size_t)marker_name >= sizeof path) return HPI_UNAVAILABLE;
+    FILE *marker = fopen(path, "rb");
+    if (!marker) return HPI_UNAVAILABLE;
+    unsigned char format[13];
+    const size_t marker_bytes = fread(format, 1, sizeof format, marker);
+    const int marker_closed = fclose(marker);
+    if (marker_bytes != 12 || marker_closed || memcmp(format, "NPUC3720", 8) ||
+        read32(format + 8) != NPU_CACHE_VERSION) return HPI_UNAVAILABLE;
+    const uint64_t row_blocks = (uint64_t)op->K / HPI_QK8_0;
+    if (row_blocks > SIZE_MAX / sizeof(hpi_block_q8_0)) return HPI_EINVAL;
+    const size_t row_bytes = (size_t)row_blocks * sizeof(hpi_block_q8_0);
+    if ((uint64_t)op->N > SIZE_MAX / row_bytes) return HPI_EINVAL;
+    const size_t wbytes = (size_t)op->N * row_bytes;
+    const uint64_t capacity = op->M == 1 ? 1u : 256u;
+    unsigned char source_digest[32];
+    sha256_hash(source_digest, (const unsigned char *)op->w, wbytes);
+    char hex[65];
+    digest_hex(source_digest, hex);
+    const int written = snprintf(path, sizeof path, "%s/v2_%s_n%lld_k%lld_m%llu.npub",
+        cache, hex, (long long)op->N, (long long)op->K, (unsigned long long)capacity);
+    if (written <= 0 || (size_t)written >= sizeof path) return HPI_UNAVAILABLE;
+    unsigned char *file = NULL;
+    size_t length = 0;
+    if (read_file(path, &file, &length)) return HPI_UNAVAILABLE;
+    /* Offsets are the explicit little-endian 128-byte v2 header, never a C struct cast. */
+    const uint32_t slab = read32(file + 48), layout = read32(file + 52);
+    const int layout_ok = capacity == 1 ? (layout == 1 || layout == 2) : layout == 3;
+    if (memcmp(file, "NPUC3720", 8) || read32(file + 8) != NPU_CACHE_VERSION ||
+        read32(file + 12) != NPU_CACHE_HEADER || read32(file + 16) != 8 ||
+        read32(file + 20) != 1 || read64(file + 24) != capacity ||
+        read64(file + 32) != (uint64_t)op->N || read64(file + 40) != (uint64_t)op->K ||
+        !slab || slab % 32 || (uint64_t)op->N % slab || !layout_ok ||
+        (layout == 2 && (uint64_t)op->N % (2ull * slab)) ||
+        read64(file + 56) != wbytes || memcmp(file + 64, source_digest, 32) ||
+        memcmp(file + NPU_CACHE_HEADER, "\177ELF", 4)) {
+        free(file); return HPI_UNAVAILABLE;
     }
-
-    { static int said1 = 0, said2 = 0; int *sp = (op->M == 1) ? &said1 : &said2; if (!*sp) { *sp = 1;
-        fprintf(stderr, "hpi-3720: loaded DPU blob %-5s (M=%lld N=%lld K=%lld) — this op runs on the DPU.\n",
-                suffix[0] ? suffix : ".m1", (long long)op->M, (long long)op->N, (long long)op->K); } }
-    *blob = buf; *blob_len = len;
-    io->arg_x = 0;   /* 'x'      (input,  sym 1) */
-    io->arg_y = 1;   /* 'Relu_5' (output, sym 2) */
-    io->arg_w = -1;  /* weights baked into the blob */
+    unsigned char payload_digest[32];
+    const size_t payload_size = length - NPU_CACHE_HEADER;
+    sha256_hash(payload_digest, file + NPU_CACHE_HEADER, payload_size);
+    if (memcmp(file + 96, payload_digest, 32)) { free(file); return HPI_UNAVAILABLE; }
+    /* Reuse the allocation; caller owns the ELF buffer and frees it after graph teardown. */
+    memmove(file, file + NPU_CACHE_HEADER, payload_size);
+    *blob = file; *blob_len = payload_size;
+    io->arg_x = 0; io->arg_y = 1; io->arg_w = -1;
     return HPI_OK;
 }
-
-#endif /* HPI_HAVE_NPU_3720 */
+#endif

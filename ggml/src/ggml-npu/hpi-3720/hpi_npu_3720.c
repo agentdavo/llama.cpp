@@ -121,6 +121,12 @@ typedef struct {
     int         in_use;
 } npu3720_shape;
 
+#define NPU3720_MISS_MAX 1024
+typedef struct {
+    const void *w_key;
+    int64_t capacity, N, K;
+} npu3720_miss;
+
 typedef struct {
     npu_ze                    z;
     npu_dev                   d;
@@ -128,6 +134,8 @@ typedef struct {
     int                       q_ok;
     npu3720_shape             cache[NPU3720_CACHE_MAX];
     int                       ncache;
+    npu3720_miss               misses[NPU3720_MISS_MAX];
+    int                       nmisses;
     hpi_profile              *profile;
     size_t                    blob_bytes_resident;  /* sum of blob_len over graphs the device accepted;
                                                      * printed on a graph-create failure so the ceiling
@@ -360,7 +368,24 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     npu3720_shape *s = shape_find(p, op);
     if (!s) {
         if (p->profile) p->profile->cache_misses++;
-        s = shape_build(p, op, st);
+        /* Fixed weights/cache for this device lifetime. Avoid rehashing an entire
+         * unavailable tensor on every token. Restart after changing the cache.
+         * A full negative cache conservatively declines new cold shapes. */
+        const int64_t capacity = op->M == 1 ? 1 : (op->M <= 256 ? 256 : op->M);
+        int missing = p->nmisses == NPU3720_MISS_MAX;
+        for (int i = 0; !missing && i < p->nmisses; ++i) {
+            const npu3720_miss *m = &p->misses[i];
+            missing = m->w_key == op->w && m->capacity == capacity && m->N == op->N && m->K == op->K;
+        }
+        if (missing) {
+            *st = HPI_UNAVAILABLE;
+        } else {
+            s = shape_build(p, op, st);
+            if (!s && *st == HPI_UNAVAILABLE) {
+                npu3720_miss *m = &p->misses[p->nmisses++];
+                m->w_key = op->w; m->capacity = capacity; m->N = op->N; m->K = op->K;
+            }
+        }
     }
     if (p->profile) p->profile->prepare_ms += npu_now_ms() - t0;
     if (!s) return NULL;
