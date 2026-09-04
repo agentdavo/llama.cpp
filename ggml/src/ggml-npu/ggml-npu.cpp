@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 static bool ggml_backend_npu_gpu_offload(void);   // NPU_OFFLOAD_GPU: whole-layer GPU offload vs default ACCEL
 
@@ -473,6 +474,23 @@ ggml_backend_t ggml_backend_npu_init(void) {
         // GPU-passthrough mode: an internal CPU backend computes every non-DPU node of the whole layers
         // that -ngl places on us (see ggml_backend_npu_graph_compute).
         ctx->cpu = ggml_backend_cpu_init();
+        // THREAD COUNT MATTERS ENORMOUSLY HERE. In GPU-passthrough we get EVERY node of the layers
+        // -ngl placed on us and delegate all non-DPU ones to this backend — ~7700 of 7986 nodes per
+        // token on Flash-Next. ggml_backend_cpu_init() defaults to GGML_DEFAULT_N_THREADS = 4
+        // (ggml.h:232), so without this the bulk of the graph ran on 4 threads while the CPU-only
+        // comparison used all 20. MEASURED before this fix: NPU 1.17 t/s vs CPU-only 1.98 t/s — the
+        // "NPU" path was LOSING to plain CPU, and the thread count was the reason, not the DPU.
+        // GGML_NPU_CPU_THREADS overrides; default is the machine's hardware concurrency.
+        if (ctx->cpu) {
+            int nth = (int) std::thread::hardware_concurrency();
+            if (nth <= 0) nth = 4;
+            if (const char * e = getenv("GGML_NPU_CPU_THREADS")) {
+                const int v = atoi(e);
+                if (v > 0) nth = v;
+            }
+            ggml_backend_cpu_set_n_threads(ctx->cpu, nth);
+            NPU_TRACE("internal CPU backend: %d threads\n", nth);
+        }
         if (!ctx->cpu) {
             GGML_LOG_ERROR("%s: NPU_OFFLOAD_GPU set but ggml_backend_cpu_init() failed\n", __func__);
             hpi_close(ctx->hpi); delete ctx; return NULL;
