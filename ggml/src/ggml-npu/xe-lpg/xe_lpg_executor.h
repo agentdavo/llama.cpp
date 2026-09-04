@@ -52,10 +52,12 @@ typedef struct {
     uint64_t exact_replays;
     uint64_t mismatches;
     uint64_t failures;
+    uint64_t queue_submissions;
+    uint64_t queue_waits;
 } xe_lpg_profile;
 
 xe_lpg_executor *xe_lpg_executor_create(
-        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32]);
+        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32], int fused_list);
 void xe_lpg_executor_destroy(xe_lpg_executor *executor);
 const char *xe_lpg_executor_error(const xe_lpg_executor *executor);
 void xe_lpg_executor_profile(const xe_lpg_executor *executor, xe_lpg_profile *profile);

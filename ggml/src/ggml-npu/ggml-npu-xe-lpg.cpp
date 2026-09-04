@@ -19,6 +19,7 @@ struct ggml_backend_npu_xe_lpg {
     bool disabled;
     bool replace_requested;
     bool replacement_ready;
+    bool fused_list;
     uint64_t warming;
     uint64_t exact;
     uint64_t skipped;
@@ -106,9 +107,10 @@ ggml_backend_npu_xe_lpg *ggml_backend_npu_xe_lpg_create(const void *model_identi
     bridge->epoch = 1;
     bridge->block = block;
     bridge->replace_requested = env_enabled("GGML_NPU_XE_LPG_REPLACE");
+    bridge->fused_list = env_enabled("GGML_NPU_XE_LPG_FUSED_LIST");
     bridge->executor = xe_lpg_executor_create(
             module, static_cast<size_t>(cache_mib) * 1024 * 1024,
-            bridge->replace_requested ? exact_module_sha256 : nullptr);
+            bridge->replace_requested ? exact_module_sha256 : nullptr, bridge->fused_list ? 1 : 0);
     if (!bridge->executor) {
         std::fprintf(stderr, "xe-lpg: Level Zero shadow executor unavailable\n");
         delete bridge;
@@ -118,8 +120,9 @@ ggml_backend_npu_xe_lpg *ggml_backend_npu_xe_lpg_create(const void *model_identi
         std::fprintf(stderr, "xe-lpg: replacement requires all 512 experts resident; shadow remains CPU-authoritative\n");
         bridge->replace_requested = false;
     }
-    std::fprintf(stderr, "xe-lpg: shadow replay enabled for block %u with %u MiB packed cache; replacement=%s\n",
-                 block, cache_mib, bridge->replace_requested ? "requested but unarmed" : "off");
+    std::fprintf(stderr, "xe-lpg: shadow replay enabled for block %u with %u MiB packed cache; replacement=%s fused_list=%s\n",
+                 block, cache_mib, bridge->replace_requested ? "requested but unarmed" : "off",
+                 bridge->fused_list ? "on" : "off");
     return bridge;
 }
 
@@ -134,11 +137,13 @@ void ggml_backend_npu_xe_lpg_destroy(ggml_backend_npu_xe_lpg *bridge) {
                  " replaced=%" PRIu64 " replace_fallbacks=%" PRIu64 " full_prefills=%" PRIu64
                  " hits=%" PRIu64 " misses=%" PRIu64 " evictions=%" PRIu64 " fill_bytes=%" PRIu64
                  " timed_misses=%" PRIu64 " timed_evictions=%" PRIu64 " timed_fill_bytes=%" PRIu64
-                 " mismatches=%" PRIu64 " failures=%" PRIu64 "\n",
+                 " mismatches=%" PRIu64 " failures=%" PRIu64 " queue_submissions=%" PRIu64
+                 " queue_waits=%" PRIu64 " fused_list=%d\n",
                  bridge->exact, bridge->warming, bridge->skipped, bridge->replaced, bridge->replace_fallbacks,
                  bridge->full_prefills, profile.hits, profile.misses,
                  profile.evictions, profile.fill_bytes, timed_misses, timed_evictions, timed_fill_bytes,
-                 profile.mismatches, profile.failures);
+                 profile.mismatches, profile.failures, profile.queue_submissions, profile.queue_waits,
+                 static_cast<int>(bridge->fused_list));
     xe_lpg_executor_destroy(bridge->executor);
     delete bridge;
 }
@@ -155,11 +160,13 @@ void ggml_backend_npu_xe_lpg_report_graph(const ggml_backend_npu_xe_lpg *bridge)
                  " replaced=%" PRIu64 " replace_fallbacks=%" PRIu64 " full_prefills=%" PRIu64
                  " hits=%" PRIu64 " misses=%" PRIu64 " evictions=%" PRIu64 " fill_bytes=%" PRIu64
                  " timed_misses=%" PRIu64 " timed_evictions=%" PRIu64 " timed_fill_bytes=%" PRIu64
-                 " mismatches=%" PRIu64 " failures=%" PRIu64 " ready=%d disabled=%d\n",
+                 " mismatches=%" PRIu64 " failures=%" PRIu64 " queue_submissions=%" PRIu64
+                 " queue_waits=%" PRIu64 " fused_list=%d ready=%d disabled=%d\n",
                  bridge->model_id, bridge->exact, bridge->warming, bridge->skipped,
                  bridge->replaced, bridge->replace_fallbacks, bridge->full_prefills,
                  profile.hits, profile.misses, profile.evictions, profile.fill_bytes,
                  timed_misses, timed_evictions, timed_fill_bytes, profile.mismatches, profile.failures,
+                 profile.queue_submissions, profile.queue_waits, static_cast<int>(bridge->fused_list),
                  static_cast<int>(bridge->replacement_ready), static_cast<int>(bridge->disabled));
 }
 

@@ -124,6 +124,9 @@ default). `GGML_NPU_XE_LPG_SHADOW_BLOCK` selects one layer (block 0 by default).
 `GGML_NPU_XE_LPG_PROFILE_EACH_GRAPH=1` prints a cumulative bridge and executor
 profile after each successful graph compute. It is intended for correctness
 gates whose long-lived server process cannot provide a destructor profile.
+`GGML_NPU_XE_LPG_FUSED_LIST=1` selects an experimental one-command-list replay
+with explicit activation and Q8_1 memory-range barriers. It defaults OFF; the
+bridge passes the parsed mode into the executor explicitly.
 The cache key includes model and epoch identity, all three tensor identities,
 layer, storage types, layout, expert ID, and matrix dimensions. Active route
 slots cannot be evicted.

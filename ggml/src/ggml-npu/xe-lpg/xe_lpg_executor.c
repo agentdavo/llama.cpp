@@ -38,6 +38,7 @@ struct xe_lpg_executor {
     xe_lpg_profile profile;
     atomic_flag busy;
     int full_dirty;
+    int fused_list;
     char error[512];
 };
 
@@ -147,7 +148,7 @@ static int resolve_slots(
 }
 
 xe_lpg_executor *xe_lpg_executor_create(
-        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32]) {
+        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32], int fused_list) {
     xe_lpg_executor *executor = NULL;
     unsigned char *module = NULL;
     size_t module_bytes = 0;
@@ -177,6 +178,7 @@ xe_lpg_executor *xe_lpg_executor_create(
         goto error;
     }
     atomic_flag_clear_explicit(&executor->busy, memory_order_release);
+    executor->fused_list = fused_list != 0;
     size_t capacity = cache_bytes / XE_TRIPLET_BYTES;
     if (capacity > 512) capacity = 512;
     executor->capacity = (uint32_t)capacity;
@@ -256,6 +258,23 @@ static void executor_unlock(xe_lpg_executor *executor) {
     atomic_flag_clear_explicit(&executor->busy, memory_order_release);
 }
 
+static int executor_execute(xe_lpg_executor *executor) {
+    if (ze_gpu_execute(&executor->gpu)) return -1;
+    executor->profile.queue_submissions++;
+    return 0;
+}
+
+static int executor_wait(xe_lpg_executor *executor) {
+    if (ze_gpu_wait(&executor->gpu, 10000000000ull)) return -1;
+    executor->profile.queue_waits++;
+    return 0;
+}
+
+static void executor_cleanup_failed_replay(xe_lpg_executor *executor) {
+    if (executor->gpu.pending || executor->gpu.recorded)
+        (void)ze_gpu_wait(&executor->gpu, 10000000000ull);
+}
+
 int xe_lpg_executor_prefill(xe_lpg_executor *executor, const xe_lpg_expert *experts, uint32_t count) {
     if (executor_lock(executor)) return -1;
     int result = -1;
@@ -307,8 +326,6 @@ static xe_lpg_replay_status replay_locked(
         }
         fprintf(stderr, "xe-lpg: full-cache coherency ranges=3 gate=%zu up=%zu down=%zu bytes\n",
                 executor->buffers[0].size, executor->buffers[1].size, executor->buffers[2].size);
-        for (uint32_t slot = 0; slot < executor->capacity; ++slot) executor->slots[slot].dirty = 0;
-        executor->full_dirty = 0;
     } else {
         for (uint32_t slot = 0; slot < executor->capacity; ++slot) if (executor->slots[slot].dirty) {
             const size_t bytes[3] = {XE_GATE_BYTES, XE_UP_BYTES, XE_DOWN_BYTES};
@@ -316,7 +333,6 @@ static xe_lpg_replay_status replay_locked(
                 range_sizes[range_count] = bytes[role];
                 ranges[range_count++] = (const unsigned char *)executor->buffers[role].data + (size_t)slot * bytes[role];
             }
-            executor->slots[slot].dirty = 0;
         }
     }
     range_sizes[range_count] = executor->buffers[3].size; ranges[range_count++] = executor->buffers[3].data;
@@ -326,13 +342,27 @@ static xe_lpg_replay_status replay_locked(
     const uint32_t quant_groups[3] = {200, 1, 1};
     const uint32_t down_groups[3] = {25600, 1, 1};
     if (ze_gpu_record_memory_ranges(&executor->gpu, range_count, range_sizes, ranges) ||
-        ze_gpu_record(&executor->gate, local, gate_groups) || ze_gpu_execute(&executor->gpu) ||
-        ze_gpu_wait(&executor->gpu, 10000000000ull) || ze_gpu_record(&executor->quant, local, quant_groups)) goto gpu_fail;
+        ze_gpu_record(&executor->gate, local, gate_groups)) goto gpu_fail;
+    if (executor->fused_list) {
+        const size_t activation_bytes = executor->buffers[7].size;
+        const void *activation_data = executor->buffers[7].data;
+        if (ze_gpu_record_memory_ranges(&executor->gpu, 1, &activation_bytes, &activation_data) ||
+            ze_gpu_record(&executor->quant, local, quant_groups)) goto gpu_fail;
+    } else if (executor_execute(executor) || executor_wait(executor) ||
+               ze_gpu_record(&executor->quant, local, quant_groups)) {
+        goto gpu_fail;
+    }
     const size_t quant_bytes = executor->buffers[8].size;
     const void *quant_data = executor->buffers[8].data;
     if (ze_gpu_record_memory_ranges(&executor->gpu, 1, &quant_bytes, &quant_data) ||
-        ze_gpu_record(&executor->down, local, down_groups) || ze_gpu_execute(&executor->gpu) ||
-        ze_gpu_wait(&executor->gpu, 10000000000ull)) goto gpu_fail;
+        ze_gpu_record(&executor->down, local, down_groups) || executor_execute(executor) ||
+        executor_wait(executor)) goto gpu_fail;
+    if (executor->full_dirty) {
+        for (uint32_t slot = 0; slot < executor->capacity; ++slot) executor->slots[slot].dirty = 0;
+        executor->full_dirty = 0;
+    } else {
+        for (uint32_t slot = 0; slot < executor->capacity; ++slot) executor->slots[slot].dirty = 0;
+    }
     if ((expected_gate && memcmp(executor->buffers[5].data, expected_gate, 6400 * sizeof(float))) ||
         (expected_up && memcmp(executor->buffers[6].data, expected_up, 6400 * sizeof(float))) ||
         (expected_down && memcmp(executor->buffers[9].data, expected_down, 25600 * sizeof(float)))) {
@@ -355,6 +385,7 @@ static xe_lpg_replay_status replay_locked(
     return XE_LPG_REPLAY_EXACT;
 gpu_fail:
     fail(executor, "Level Zero replay");
+    executor_cleanup_failed_replay(executor);
     return XE_LPG_REPLAY_UNAVAILABLE;
 }
 
