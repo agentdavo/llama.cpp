@@ -169,7 +169,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if ((uint32_t) seq_id >= this->n_seq_max) {
+    if (seq_id >= 0 && (uint32_t) seq_id >= this->n_seq_max) {
         LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, this->n_seq_max);
         return false;
     }
@@ -177,6 +177,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        if (seq_id < 0) {
+            for (auto & cell : cells) {
+                cell.tail = -1;
+            }
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
