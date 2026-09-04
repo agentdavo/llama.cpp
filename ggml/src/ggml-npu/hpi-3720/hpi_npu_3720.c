@@ -18,6 +18,7 @@
 #define NPU_NO_GDN
 #endif
 #include "npu.h"
+#include "hpi_npu3720_simd.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,7 @@ typedef struct {
     size_t                    blob_bytes_resident;  /* sum of blob_len over graphs the device accepted;
                                                      * printed on a graph-create failure so the ceiling
                                                      * can be read as COUNT- or MEMORY-bound. */
+    int simd;
 } npu3720_priv;
 
 static int64_t shape_capacity(const hpi_q8_0_gemm *op) {
@@ -129,6 +131,8 @@ static hpi_status npu_open(hpi_device *dev) {
     npu3720_priv *p = (npu3720_priv *)calloc(1, sizeof *p);
     if (!p) return HPI_ENOMEM;
     p->profile = dev->profile.enabled ? &dev->profile : NULL;
+    const char *simd = getenv("GGML_NPU_SIMD");
+    p->simd = simd && simd[0] && simd[0] != '0' && hpi3720_has_f16c();
 
     /* Step 1: load the Level Zero loader and open the first VPU device (+ context + graph table). */
     if (npu_ze_load(&p->z, 0) != 0) { free(p); return HPI_EDEVICE; }
@@ -194,14 +198,15 @@ retain:
 
 /* Copy `n` host floats into device buffer `dst` in the graph-argument precision `prec`. */
 static hpi_status stage_in_f32(void *dst, ze_graph_argument_precision_t prec,
-                               const float *src, size_t n) {
+                               const float *src, size_t n, int simd) {
     if (prec == ZE_GRAPH_ARGUMENT_PRECISION_FP32) {
         memcpy(dst, src, n * sizeof(float));
         return HPI_OK;
     }
     if (prec == ZE_GRAPH_ARGUMENT_PRECISION_FP16) {
         uint16_t *d16 = (uint16_t *)dst;
-        for (size_t i = 0; i < n; i++) d16[i] = npu_f32_to_f16(src[i]);
+        if (simd) hpi3720_pack_f16(d16, src, n);
+        else for (size_t i = 0; i < n; i++) d16[i] = npu_f32_to_f16(src[i]);
         return HPI_OK;
     }
     return HPI_EDEVICE;   /* blob wants a precision the plumbing doesn't convert to yet */
@@ -209,14 +214,15 @@ static hpi_status stage_in_f32(void *dst, ze_graph_argument_precision_t prec,
 
 /* Copy `n` values out of device buffer `src` (precision `prec`) into host floats `dst`. */
 static hpi_status stage_out_f32(float *dst, ze_graph_argument_precision_t prec,
-                                const void *src, size_t n) {
+                                const void *src, size_t n, int simd) {
     if (prec == ZE_GRAPH_ARGUMENT_PRECISION_FP32) {
         memcpy(dst, src, n * sizeof(float));
         return HPI_OK;
     }
     if (prec == ZE_GRAPH_ARGUMENT_PRECISION_FP16) {
         const uint16_t *s16 = (const uint16_t *)src;
-        for (size_t i = 0; i < n; i++) dst[i] = npu_f16_to_f32(s16[i]);
+        if (simd) hpi3720_unpack_f16(dst, s16, n);
+        else for (size_t i = 0; i < n; i++) dst[i] = npu_f16_to_f32(s16[i]);
         return HPI_OK;
     }
     return HPI_EDEVICE;
@@ -388,7 +394,7 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     const size_t staged = (size_t)op->M * (size_t)op->K;
     t0 = p->profile ? npu_now_ms() : 0.0;
     if (ax->elems > staged) memset(s->x_mem, 0, ax->bytes);
-    hpi_status cst = stage_in_f32(s->x_mem, ax->precision, op->x, staged);
+    hpi_status cst = stage_in_f32(s->x_mem, ax->precision, op->x, staged, p->simd);
     if (p->profile) p->profile->input_ms += npu_now_ms() - t0;
     if (cst != HPI_OK) {
         if (s->program_slot) s->program_slot->state = HPI3720_IDLE;
@@ -454,7 +460,7 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
 static hpi_status npu_finish(npu3720_priv *p, npu3720_shape *s, const hpi_q8_0_gemm *op) {
     const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
     const double t0 = p->profile ? npu_now_ms() : 0.0;
-    const hpi_status st = stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N);
+    const hpi_status st = stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N, p->simd);
     if (p->profile) p->profile->output_ms += npu_now_ms() - t0;
     if (s->program_slot) s->program_slot->state = HPI3720_IDLE;
     s->program_slot = NULL;
@@ -478,7 +484,8 @@ static hpi_status npu_cpu_fallback(hpi_device *dev, const hpi_q8_0_gemm *op) {
 }
 
 /* API wall times include driver overhead; sync_ms is not an isolated device compute timer. */
-static hpi_status npu_submit(npu3720_priv *p, ze_command_list_handle_t *lists, uint32_t n) {
+static hpi_status npu_submit_work(npu3720_priv *p, ze_command_list_handle_t *lists,
+        uint32_t n, hpi_host_work work, void *user) {
     for (int i = 0; i < p->nprograms; ++i) for (int j = 0; j < 2; ++j) {
         hpi3720_exec_slot *slot = &p->programs[i].slots[j];
         for (uint32_t k = 0; k < n; ++k)
@@ -495,6 +502,14 @@ static hpi_status npu_submit(npu3720_priv *p, ze_command_list_handle_t *lists, u
         fprintf(stderr, "hpi-3720: queue submit failed: 0x%x\n", (unsigned)result);
         p->failed = 1; return HPI_EDEVICE;
     }
+    if (work) {
+        t0 = p->profile ? npu_now_ms() : 0.0;
+        work(user);
+        if (p->profile) {
+            p->profile->host_work_ms += npu_now_ms() - t0;
+            p->profile->host_work_calls++;
+        }
+    }
     t0 = p->profile ? npu_now_ms() : 0.0;
     result = p->z.zeCommandQueueSynchronize(p->q, UINT64_MAX);
     if (p->profile) p->profile->sync_ms += npu_now_ms() - t0;
@@ -503,6 +518,10 @@ static hpi_status npu_submit(npu3720_priv *p, ze_command_list_handle_t *lists, u
         p->failed = 1; return HPI_EDEVICE;
     }
     return HPI_OK;
+}
+
+static hpi_status npu_submit(npu3720_priv *p, ze_command_list_handle_t *lists, uint32_t n) {
+    return npu_submit_work(p, lists, n, NULL, NULL);
 }
 
 static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
@@ -521,13 +540,15 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
  * zeCommandQueueExecuteCommandLists + ONE zeCommandQueueSynchronize (amortizes the per-op submit+sync
  * that dominates small ops), then read all outputs. Uncached ops fall to the CPU reference in place. */
 #define NPU_GEMM_BATCH_MAX 32
-static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results) {
+static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops, int n,
+        hpi_status *results, hpi_host_work work, void *user) {
     if (!dev || !dev->priv || !ops || n <= 0) return HPI_EINVAL;
     npu3720_priv *p = (npu3720_priv *)dev->priv;
     if (n > NPU_GEMM_BATCH_MAX) {                                   /* split oversized batches */
         for (int off = 0; off < n; off += NPU_GEMM_BATCH_MAX) {
             int m = (n - off < NPU_GEMM_BATCH_MAX) ? (n - off) : NPU_GEMM_BATCH_MAX;
-            hpi_status st = npu_gemm_batch_impl(dev, ops + off, m, results ? results + off : NULL);
+            hpi_status st = npu_gemm_batch_impl(dev, ops + off, m, results ? results + off : NULL,
+                    off + m == n ? work : NULL, user);
             if (st != HPI_OK) return st;
         }
         return HPI_OK;
@@ -536,9 +557,9 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
     for (int i = 1; i < n; i++) for (int j = 0; j < i; j++) {
         if (ops[i].w == ops[j].w && shape_capacity(&ops[i]) == shape_capacity(&ops[j]) &&
             ops[i].N == ops[j].N && ops[i].K == ops[j].K) {
-            hpi_status st = npu_gemm_batch_impl(dev, ops, i, results);
+            hpi_status st = npu_gemm_batch_impl(dev, ops, i, results, NULL, NULL);
             if (st != HPI_OK) return st;
-            return npu_gemm_batch_impl(dev, ops + i, n - i, results ? results + i : NULL);
+            return npu_gemm_batch_impl(dev, ops + i, n - i, results ? results + i : NULL, work, user);
         }
     }
     npu3720_shape *sh[NPU_GEMM_BATCH_MAX] = {0};
@@ -570,9 +591,10 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
         lists[nlist++] = sh[i]->exec_list;
     }
     if (nlist) {
-        const hpi_status st = npu_submit(p, lists, (uint32_t)nlist);
+        const hpi_status st = npu_submit_work(p, lists, (uint32_t)nlist, work, user);
         if (st != HPI_OK) return st;
     }
+    if (!nlist && work) work(user);
     for (int i = begin; i < n; ++i) if (sh[i]) {
         const hpi_status st = npu_finish(p, sh[i], &ops[i]);
         if (st != HPI_OK) return st;
@@ -582,11 +604,16 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
 }
 
 static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n) {
-    return npu_gemm_batch_impl(dev, ops, n, NULL);
+    return npu_gemm_batch_impl(dev, ops, n, NULL, NULL, NULL);
 }
 
 static hpi_status npu_gemm_batch_try(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results) {
-    return npu_gemm_batch_impl(dev, ops, n, results);
+    return npu_gemm_batch_impl(dev, ops, n, results, NULL, NULL);
+}
+
+static hpi_status npu_gemm_batch_overlap(hpi_device *dev, const hpi_q8_0_gemm *ops,
+        int n, hpi_status *results, hpi_host_work work, void *user) {
+    return npu_gemm_batch_impl(dev, ops, n, results, work, user);
 }
 
 static const hpi_backend_ops g_npu_ops = {
@@ -599,6 +626,7 @@ static const hpi_backend_ops g_npu_ops = {
     .gemm_batch = npu_gemm_batch,
     .close = npu_close,
     .gemm_batch_try = npu_gemm_batch_try,
+    .gemm_batch_overlap = npu_gemm_batch_overlap,
 };
 
 const hpi_backend_ops *hpi_backend_npu_3720(void) { return &g_npu_ops; }

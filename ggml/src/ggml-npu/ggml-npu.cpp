@@ -17,6 +17,7 @@
 #include "ggml-cpu.h"   // ggml_backend_cpu_buffer_type / _from_ptr
 
 #include "hpi-3720/hpi.h"
+#include "ggml-npu-deps.h"
 
 #include <cstring>
 #include <cstdio>
@@ -248,7 +249,9 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     GGML_ASSERT(hpi_get_profile(ctx->hpi, &before) == HPI_OK);
     const int64_t start_us = before.enabled ? ggml_time_us() : 0;
     double cpu_ms = 0.0;
-    uint64_t cpu_batches = 0;
+    uint64_t cpu_batches = 0, overlap_candidates = 0;
+    const char *overlap_env = getenv("GGML_NPU_OVERLAP");
+    const bool overlap = overlap_env && overlap_env[0] && overlap_env[0] != '0';
     auto report_profile = [&]() {
         if (!before.enabled) return;
         hpi_profile after = {};
@@ -261,7 +264,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         const double output = after.output_ms - before.output_ms;
         const double fallback = after.fallback_ms - before.fallback_ms;
         // A scheduler graph view can cover part of a token. Normalize at the benchmark boundary.
-        fprintf(stderr, "NPU_PROFILE graph=%llu nodes=%d wall_ms=%.6f cpu_ms=%.6f prepare_ms=%.6f input_ms=%.6f submit_ms=%.6f sync_ms=%.6f output_ms=%.6f fallback_ms=%.6f other_ms=%.6f cpu_batches=%llu submissions=%llu graphs=%llu fallback_ops=%llu cache_misses=%llu lookup_ms=%.6f build_ms=%.6f init_ms=%.6f record_ms=%.6f warm_hits=%llu negative_hits=%llu shape_builds=%llu command_records=%llu list_reuses=%llu\n",
+        fprintf(stderr, "NPU_PROFILE graph=%llu nodes=%d wall_ms=%.6f cpu_ms=%.6f prepare_ms=%.6f input_ms=%.6f submit_ms=%.6f sync_ms=%.6f output_ms=%.6f fallback_ms=%.6f other_ms=%.6f cpu_batches=%llu submissions=%llu graphs=%llu fallback_ops=%llu cache_misses=%llu lookup_ms=%.6f build_ms=%.6f init_ms=%.6f record_ms=%.6f warm_hits=%llu negative_hits=%llu shape_builds=%llu command_records=%llu list_reuses=%llu host_work_ms=%.6f host_work_calls=%llu overlap_candidates=%llu\n",
                 (unsigned long long)++ctx->profile_graphs, cgraph->n_nodes,
                 wall_ms, cpu_ms, prepare, input, submit, sync, output, fallback,
                 wall_ms - cpu_ms - prepare - input - submit - sync - output - fallback,
@@ -276,7 +279,10 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 (unsigned long long)(after.negative_hits - before.negative_hits),
                 (unsigned long long)(after.shape_builds - before.shape_builds),
                 (unsigned long long)(after.command_records - before.command_records),
-                (unsigned long long)(after.list_reuses - before.list_reuses));
+                (unsigned long long)(after.list_reuses - before.list_reuses),
+                after.host_work_ms - before.host_work_ms,
+                (unsigned long long)(after.host_work_calls - before.host_work_calls),
+                (unsigned long long)overlap_candidates);
     };
 
     if (!ctx->cpu) {
@@ -366,7 +372,13 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 fflush(stderr);
             }
             hpi_status results[DPU_BATCH];
-            GGML_ASSERT(hpi_q8_0_gemm_batch_try(ctx->hpi, dpu_ops, n_dpu, results) == HPI_OK);
+            if (overlap && batch->n_nodes > 0) {
+                auto work = [](void *user) { (*static_cast<decltype(flush_cpu) *>(user))(); };
+                GGML_ASSERT(hpi_q8_0_gemm_batch_overlap(ctx->hpi, dpu_ops, n_dpu, results,
+                            work, &flush_cpu) == HPI_OK);
+            } else {
+                GGML_ASSERT(hpi_q8_0_gemm_batch_try(ctx->hpi, dpu_ops, n_dpu, results) == HPI_OK);
+            }
             if (getenv("GGML_NPU_TRACE_NODES")) { fprintf(stderr, "hpi-3720:   << flush_dpu ok\n"); fflush(stderr); }
             for (int j = 0; j < n_dpu; j++) {
                 if (results[j] == HPI_UNAVAILABLE) {
@@ -421,10 +433,11 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
             fflush(stderr);
         }
         if (batchable) {
+            if (n_dpu && batch->n_nodes) flush_dpu();
             flush_cpu();   // this DPU op may read a CPU-computed input -> ensure the CPU batch has run
             bool dep = false;   // never batch an op that reads a not-yet-executed batched DPU output
             for (int k = 0; k < n_dpu; k++) {
-                if (node->src[0] == dpu_dst[k] || node->src[1] == dpu_dst[k]) { dep = true; break; }
+                if (!ggml_npu_independent(node, dpu_dst[k])) { dep = true; break; }
             }
             if (dep || n_dpu == DPU_BATCH) {
                 flush_dpu();
@@ -439,7 +452,18 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
             dpu_dst[n_dpu] = node;
             n_dpu++;
         } else {
-            flush_dpu();   // this node may read a batched DPU output -> execute the batch first
+            bool independent = overlap && n_dpu > 0;
+            if (independent && (ggml_backend_npu_dpu_cacheable(node) || ggml_backend_npu_mmid_cacheable(node)))
+                independent = false;
+            for (int k = 0; independent && k < n_dpu; ++k)
+                independent = ggml_npu_independent(node, dpu_dst[k]);
+            if (independent && ggml_npu_metadata_op(node->op)) continue;
+            if (independent && batch->n_nodes < batch_cap) {
+                batch->nodes[batch->n_nodes++] = node;
+                if (!ggml_npu_metadata_op(node->op)) overlap_candidates++;
+                continue;
+            }
+            flush_dpu();   // resolve device outputs before a dependent or side-effecting CPU op
             if (ggml_backend_npu_dpu_cacheable(node)) {
                 flush_cpu();
                 ggml_backend_npu_mul_mat(ctx, node);   // cacheable but ne12/ne13>1 (multi-GEMM) -> run individually

@@ -103,6 +103,21 @@ hpi_status hpi_q8_0_gemm_batch_try(hpi_device *dev, const hpi_q8_0_gemm *ops, in
     return dev->ops->gemm_batch_try(dev, ops, n, results);
 }
 
+hpi_status hpi_q8_0_gemm_batch_overlap(hpi_device *dev, const hpi_q8_0_gemm *ops,
+        int n, hpi_status *results, hpi_host_work work, void *user) {
+    if (!dev || !dev->ops || !ops || !results || n <= 0) return HPI_EINVAL;
+    for (int i = 0; i < n; ++i) {
+        const hpi_q8_0_gemm *op = &ops[i];
+        if (!op->w || !op->x || !op->y || op->M <= 0 || op->N <= 0 || op->K <= 0 || op->K % HPI_QK8_0) return HPI_EINVAL;
+        results[i] = HPI_UNAVAILABLE;
+    }
+    if (dev->ops->gemm_batch_overlap)
+        return dev->ops->gemm_batch_overlap(dev, ops, n, results, work, user);
+    const hpi_status st = hpi_q8_0_gemm_batch_try(dev, ops, n, results);
+    if (st == HPI_OK && work) work(user);
+    return st;
+}
+
 const char *hpi_status_str(hpi_status s) {
     switch (s) {
         case HPI_OK:          return "ok";

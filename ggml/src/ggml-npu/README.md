@@ -84,3 +84,27 @@ It is intentionally **not yet wired into the ggml backend registry** (`ggml/src/
 
 See [`hpi-3720/README.md`](hpi-3720/README.md) for the interface, the build/test steps, and the
 implementation plan.
+
+
+### Optional host overlap and SIMD staging
+
+`GGML_NPU_OVERLAP=1` enables conservative CPU/NPU overlap in whole-layer
+`NPU_OFFLOAD_GPU=1` mode. Independent CPU nodes following a queued DPU batch
+run after its submission and before its completion wait. Tensor byte ranges
+include aliases and strided spans; dependent or side-effecting nodes force a
+flush. HPI remains synchronous to its caller, and slots are released only after
+completion and output conversion. Unsupported/cache-missing operations still
+use the existing CPU delegation. Default: disabled.
+
+`GGML_NPU_SIMD=1` independently enables runtime-checked AVX/F16C staging on
+GCC-compatible x86 builds. It converts eight FP32/FP16 arguments at a time,
+preserving scalar rounding and NaN bits with scalar tails. Only the conversion
+functions carry ISA target attributes; the generic driver and portable reference
+retain their original build target. Default: disabled. No weight format changes.
+
+With `GGML_NPU_PROFILE=1`, `host_work_calls` counts callbacks actually run between
+submission and wait, and `host_work_ms` records their CPU duration. That duration
+is already included in `cpu_ms`; do not add it again. `overlap_candidates` counts
+eligible CPU nodes, including candidates paired with cache misses. These are host
+scopes, not hardware-engine overlap counters. Smaller remaining wait time alone
+does not establish faster inference; compare total wall time and output correctness.

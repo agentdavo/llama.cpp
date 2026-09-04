@@ -34,6 +34,8 @@ struct hpi_backend_ops {
     /* Free priv. */
     void       (*close)(hpi_device *dev);
     hpi_status (*gemm_batch_try)(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results);
+    hpi_status (*gemm_batch_overlap)(hpi_device *dev, const hpi_q8_0_gemm *ops,
+            int n, hpi_status *results, hpi_host_work work, void *user);
 };
 
 /* Backend factories (defined in their .c files). Return NULL if compiled out. */

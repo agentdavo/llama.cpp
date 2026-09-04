@@ -61,6 +61,8 @@ typedef struct {
      * No API wall counter is a DMA/SHAVE/DPU execution measurement. */
     double lookup_ms, build_ms, init_ms, record_ms;
     uint64_t warm_hits, negative_hits, shape_builds, command_records, list_reuses;
+    double host_work_ms; /* CPU callback scope, also included in caller CPU timing. */
+    uint64_t host_work_calls;
 } hpi_profile;
 
 hpi_status hpi_get_profile(const hpi_device *dev, hpi_profile *out);
@@ -103,6 +105,15 @@ hpi_status  hpi_q8_0_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n
 
 /* Execute available hardware ops; per-op HPI_UNAVAILABLE leaves y untouched for caller fallback. */
 hpi_status  hpi_q8_0_gemm_batch_try(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results);
+
+/* Run independent host work once, after the last device submission and before its
+ * completion wait (or synchronously if no hardware op is available). The callback
+ * must not access any op's output, modify its inputs, or reenter this HPI device.
+ * All buffers remain caller-owned until this synchronous function returns. On an
+ * earlier device error the callback may not run. NULL work is equivalent to try. */
+typedef void (*hpi_host_work)(void *user);
+hpi_status hpi_q8_0_gemm_batch_overlap(hpi_device *dev, const hpi_q8_0_gemm *ops,
+        int n, hpi_status *results, hpi_host_work work, void *user);
 
 /* Release a device. Safe on NULL. */
 void        hpi_close(hpi_device *dev);
