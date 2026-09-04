@@ -143,6 +143,26 @@ void ggml_backend_npu_xe_lpg_destroy(ggml_backend_npu_xe_lpg *bridge) {
     delete bridge;
 }
 
+void ggml_backend_npu_xe_lpg_report_graph(const ggml_backend_npu_xe_lpg *bridge) {
+    if (!bridge || !env_enabled("GGML_NPU_XE_LPG_PROFILE_EACH_GRAPH")) return;
+    xe_lpg_profile profile {};
+    xe_lpg_executor_profile(bridge->executor, &profile);
+    const uint64_t timed_misses = bridge->full_prefills ? profile.misses - bridge->armed_profile.misses : 0;
+    const uint64_t timed_evictions = bridge->full_prefills ? profile.evictions - bridge->armed_profile.evictions : 0;
+    const uint64_t timed_fill_bytes = bridge->full_prefills ? profile.fill_bytes - bridge->armed_profile.fill_bytes : 0;
+    std::fprintf(stderr, "xe-lpg: graph profile model_id=0x%" PRIx64
+                 " exact=%" PRIu64 " warming=%" PRIu64 " skipped=%" PRIu64
+                 " replaced=%" PRIu64 " replace_fallbacks=%" PRIu64 " full_prefills=%" PRIu64
+                 " hits=%" PRIu64 " misses=%" PRIu64 " evictions=%" PRIu64 " fill_bytes=%" PRIu64
+                 " timed_misses=%" PRIu64 " timed_evictions=%" PRIu64 " timed_fill_bytes=%" PRIu64
+                 " mismatches=%" PRIu64 " failures=%" PRIu64 " ready=%d disabled=%d\n",
+                 bridge->model_id, bridge->exact, bridge->warming, bridge->skipped,
+                 bridge->replaced, bridge->replace_fallbacks, bridge->full_prefills,
+                 profile.hits, profile.misses, profile.evictions, profile.fill_bytes,
+                 timed_misses, timed_evictions, timed_fill_bytes, profile.mismatches, profile.failures,
+                 static_cast<int>(bridge->replacement_ready), static_cast<int>(bridge->disabled));
+}
+
 int ggml_backend_npu_xe_lpg_role(ggml_backend_npu_xe_lpg *bridge, const ggml_tensor *node) {
     if (!bridge || bridge->disabled || !node || node->op != GGML_OP_MUL_MAT_ID) return 0;
     uint32_t block = 0;

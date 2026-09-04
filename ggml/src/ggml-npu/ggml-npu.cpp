@@ -537,6 +537,9 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     flush_cpu();
     ggml_free(gctx);
     report_profile();
+#if defined(GGML_NPU_XE_LPG)
+    ggml_backend_npu_xe_lpg_report_graph(ctx->xe_lpg);
+#endif
     return GGML_STATUS_SUCCESS;
 }
 

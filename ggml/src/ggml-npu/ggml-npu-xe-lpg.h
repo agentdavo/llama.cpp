@@ -14,5 +14,6 @@ int ggml_backend_npu_xe_lpg_begin_replace(
 int ggml_backend_npu_xe_lpg_replace(ggml_backend_npu_xe_lpg *bridge, const ggml_tensor *down);
 void ggml_backend_npu_xe_lpg_abort(ggml_backend_npu_xe_lpg *bridge);
 void ggml_backend_npu_xe_lpg_complete(ggml_backend_npu_xe_lpg *bridge, const ggml_tensor *down);
+void ggml_backend_npu_xe_lpg_report_graph(const ggml_backend_npu_xe_lpg *bridge);
 
 #endif
