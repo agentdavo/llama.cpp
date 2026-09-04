@@ -1299,8 +1299,10 @@ void ggml_compute_forward_mul_mat(
     const int64_t r3 = ne13 / ne03;
 
     const bool src1_cont = ggml_is_contiguous(src1);
+    const bool f32_dot = hint == GGML_HINT_CPU_F32_DOT &&
+                        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
 
-    if (src1_cont) {
+    if (src1_cont && !f32_dot) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -502,6 +503,20 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // Set before context creation. This CPU-only experiment keeps small target batches on the same F32 reduction path.
+    const char * f32_dot = std::getenv("LLAMA_QWEN4EXP_F32_DOT");
+    if (f32_dot && std::string(f32_dot) == "1" && n_tokens <= 4) {
+        int marked = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) {
+                ggml_mul_mat_set_hint(node, GGML_HINT_CPU_F32_DOT);
+                ++marked;
+            }
+        }
+        LLAMA_LOG_DEBUG("qwen4exp: CPU F32 dot policy rows=%" PRId64 " nodes=%d\n", n_tokens, marked);
+    }
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for qwen4exp.

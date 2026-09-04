@@ -443,6 +443,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_CPU_F32_DOT     = 2, // use the CPU row-dot path for F32 x F32
     };
 
     // model file types
