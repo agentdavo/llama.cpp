@@ -442,7 +442,7 @@ function(ggml_add_cpu_backend_variant tag_name)
     if (GGML_SYSTEM_ARCH STREQUAL "x86")
         foreach (feat NATIVE
                       SSE42
-                      AVX AVX2 BMI2 AVX_VNNI FMA F16C
+                      AVX AVX2 BMI2 AVX_VNNI AVX_VNNI_INT8 AVX_VNNI_INT16 AVX_NE_CONVERT AVX_IFMA FMA F16C
                       AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16
                       AMX_TILE AMX_INT8 AMX_BF16)
             set(GGML_${feat} OFF)
@@ -510,6 +510,21 @@ if (GGML_CPU_ALL_VARIANTS)
             ggml_add_cpu_backend_variant(zen4           SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
         endif()
         ggml_add_cpu_backend_variant(alderlake          SSE42 AVX F16C FMA AVX2 BMI2 AVX_VNNI)
+        if (NOT MSVC)
+            include(CheckCXXCompilerFlag)
+            check_cxx_compiler_flag("-mavxvnniint8"  GGML_COMPILER_SUPPORTS_AVX_VNNI_INT8)
+            check_cxx_compiler_flag("-mavxvnniint16" GGML_COMPILER_SUPPORTS_AVX_VNNI_INT16)
+            check_cxx_compiler_flag("-mavxneconvert" GGML_COMPILER_SUPPORTS_AVX_NE_CONVERT)
+            check_cxx_compiler_flag("-mavxifma"      GGML_COMPILER_SUPPORTS_AVX_IFMA)
+            if (GGML_COMPILER_SUPPORTS_AVX_VNNI_INT8 AND
+                GGML_COMPILER_SUPPORTS_AVX_VNNI_INT16 AND
+                GGML_COMPILER_SUPPORTS_AVX_NE_CONVERT AND
+                GGML_COMPILER_SUPPORTS_AVX_IFMA)
+                ggml_add_cpu_backend_variant(arrowlake SSE42 AVX F16C FMA AVX2 BMI2 AVX_VNNI AVX_VNNI_INT8 AVX_VNNI_INT16 AVX_NE_CONVERT AVX_IFMA)
+            else()
+                message(STATUS "Skipping Arrow Lake CPU backend variant: compiler does not support all required ISA flags")
+            endif()
+        endif()
         if (NOT MSVC)
             # MSVC doesn't support AMX
             ggml_add_cpu_backend_variant(sapphirerapids SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16 AMX_TILE AMX_INT8)

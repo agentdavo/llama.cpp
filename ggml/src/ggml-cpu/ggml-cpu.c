@@ -3568,6 +3568,33 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
 
 void ggml_cpu_fp32_to_bf16(const float * x, ggml_bf16_t * y, int64_t n) {
     int64_t i = 0;
+#if defined(__AVXNECONVERT__) && defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        const __m256 input = _mm256_loadu_ps(x + i);
+        const __m256i bits = _mm256_castps_si256(input);
+        const __m256i abs_bits = _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff));
+        const __m256i exponent = _mm256_and_si256(abs_bits, _mm256_set1_epi32(0x7f800000));
+        const __m256i mantissa = _mm256_and_si256(abs_bits, _mm256_set1_epi32(0x007fffff));
+        const __m256i has_mantissa = _mm256_xor_si256(
+                _mm256_cmpeq_epi32(mantissa, _mm256_setzero_si256()), _mm256_set1_epi32(-1));
+        const __m256i exceptional = _mm256_and_si256(has_mantissa,
+                _mm256_or_si256(
+                    _mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()),
+                    _mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(0x7f800000))));
+
+        // VCVTNEPS2BF16 flushes FP32 subnormals and does not preserve ggml's
+        // NaN payload policy. Keep the vector fast path bit-identical to the
+        // reference conversion by handling rare exceptional vectors scalarly.
+        if (_mm256_movemask_epi8(exceptional) == 0) {
+            const __m128bh bf16 = _mm256_cvtneps_avx_pbh(input);
+            _mm_storeu_si128((__m128i *)(y + i), (__m128i) bf16);
+        } else {
+            for (int j = 0; j < 8; ++j) {
+                y[i + j] = GGML_FP32_TO_BF16(x[i + j]);
+            }
+        }
+    }
+#endif
     for (; i < n; ++i) {
         y[i] = GGML_FP32_TO_BF16(x[i]);
     }
@@ -3582,7 +3609,16 @@ void ggml_cpu_fp32_to_i32(const float * x, int32_t * y, int64_t n) {
 
 void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
     int64_t i = 0;
-#if defined(__AVX2__)
+#if defined(__AVXNECONVERT__) && defined(__AVX2__)
+    for (; i + 15 < n; i += 16) {
+        const __m256 even = _mm256_cvtneebf16_ps((const __m256bh *)(x + i));
+        const __m256 odd  = _mm256_cvtneobf16_ps((const __m256bh *)(x + i));
+        const __m256 lo   = _mm256_unpacklo_ps(even, odd);
+        const __m256 hi   = _mm256_unpackhi_ps(even, odd);
+        _mm256_storeu_ps(y + i,     _mm256_permute2f128_ps(lo, hi, 0x20));
+        _mm256_storeu_ps(y + i + 8, _mm256_permute2f128_ps(lo, hi, 0x31));
+    }
+#elif defined(__AVX2__)
 #if defined(__AVX512F__)
     for (; i + 15 < n; i += 16) {
         _mm512_storeu_ps(y + i,
@@ -3644,6 +3680,38 @@ int ggml_cpu_has_avx(void) {
 
 int ggml_cpu_has_avx_vnni(void) {
 #if defined(__AVXVNNI__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_avx_vnni_int8(void) {
+#if defined(__AVXVNNIINT8__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_avx_vnni_int16(void) {
+#if defined(__AVXVNNIINT16__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_avx_ne_convert(void) {
+#if defined(__AVXNECONVERT__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_avx_ifma(void) {
+#if defined(__AVXIFMA__)
     return 1;
 #else
     return 0;

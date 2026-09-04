@@ -548,6 +548,18 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
         if (ggml_cpu_has_avx_vnni()) {
             features.push_back({ "AVX_VNNI", "1" });
         }
+        if (ggml_cpu_has_avx_vnni_int8()) {
+            features.push_back({ "AVX_VNNI_INT8", "1" });
+        }
+        if (ggml_cpu_has_avx_vnni_int16()) {
+            features.push_back({ "AVX_VNNI_INT16", "1" });
+        }
+        if (ggml_cpu_has_avx_ne_convert()) {
+            features.push_back({ "AVX_NE_CONVERT", "1" });
+        }
+        if (ggml_cpu_has_avx_ifma()) {
+            features.push_back({ "AVX_IFMA", "1" });
+        }
         if (ggml_cpu_has_avx2()) {
             features.push_back({ "AVX2", "1" });
         }

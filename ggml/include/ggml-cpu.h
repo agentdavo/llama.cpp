@@ -82,6 +82,10 @@ extern "C" {
     GGML_BACKEND_API int ggml_cpu_has_ssse3      (void);
     GGML_BACKEND_API int ggml_cpu_has_avx        (void);
     GGML_BACKEND_API int ggml_cpu_has_avx_vnni   (void);
+    GGML_BACKEND_API int ggml_cpu_has_avx_vnni_int8(void);
+    GGML_BACKEND_API int ggml_cpu_has_avx_vnni_int16(void);
+    GGML_BACKEND_API int ggml_cpu_has_avx_ne_convert(void);
+    GGML_BACKEND_API int ggml_cpu_has_avx_ifma   (void);
     GGML_BACKEND_API int ggml_cpu_has_avx2       (void);
     GGML_BACKEND_API int ggml_cpu_has_bmi2       (void);
     GGML_BACKEND_API int ggml_cpu_has_f16c       (void);

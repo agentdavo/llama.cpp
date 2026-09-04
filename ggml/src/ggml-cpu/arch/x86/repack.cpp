@@ -1590,12 +1590,10 @@ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     // Scales of first sub block in the sb loop
                     const __m128i mins_and_scales_0 = _mm_set_epi32(utmp_0[3], utmp_0[2], utmp_0[1], utmp_0[0]);
                     __m128i scales_rearrange_0 = _mm_shuffle_epi8(mins_and_scales_0, scalemask);
-                    __m256i scales_0 = _mm256_cvtepu8_epi16(scales_rearrange_0);
 
                     // Scales of second sub block in the sb loop
                     __m128i mins_and_scales_1 = _mm_set_epi32(utmp_1[3], utmp_1[2], utmp_1[1], utmp_1[0]);
                     __m128i scales_rearrange_1 = _mm_shuffle_epi8(mins_and_scales_1, scalemask);
-                    __m256i scales_1 = _mm256_cvtepu8_epi16(scales_rearrange_1);
 
                     // Mins of first and second sub block of Q4_K block are arranged side by side
                     __m256i mins_01 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(_mm_shuffle_epi32(mins_and_scales_0, 78), _mm_shuffle_epi32(mins_and_scales_1, 78)));
@@ -1619,6 +1617,44 @@ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     // B0(28-31) B4(28-31) B1(28-31) B5(28-31) B2(28-31) B6(28-31) B3(28-31) B7(28-31) with A0(28-31)
 
 
+                    __m256i iacc_sb;
+
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+                    // VNNI accumulates each group of four u4*s8 products directly into i32.
+                    // Keeping one accumulator per Q4_K sub-block is required: each sub-block has
+                    // its own six-bit scale, which must be applied before the super-block sum.
+                    __m256i iacc_0 = _mm256_setzero_si256();
+                    __m256i iacc_1 = _mm256_setzero_si256();
+
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(rhs_vec_0123_00, _mm256_shuffle_epi32(rhs_vec_4567_00, 177), 170), _mm256_shuffle_epi32(lhs_vec_00,   0));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_00, 177), rhs_vec_4567_00, 170), _mm256_shuffle_epi32(lhs_vec_00,  85));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(rhs_vec_0123_01, _mm256_shuffle_epi32(rhs_vec_4567_01, 177), 170), _mm256_shuffle_epi32(lhs_vec_00, 170));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_01, 177), rhs_vec_4567_01, 170), _mm256_shuffle_epi32(lhs_vec_00, 255));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(rhs_vec_0123_02, _mm256_shuffle_epi32(rhs_vec_4567_02, 177), 170), _mm256_shuffle_epi32(lhs_vec_01,   0));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_02, 177), rhs_vec_4567_02, 170), _mm256_shuffle_epi32(lhs_vec_01,  85));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(rhs_vec_0123_03, _mm256_shuffle_epi32(rhs_vec_4567_03, 177), 170), _mm256_shuffle_epi32(lhs_vec_01, 170));
+                    iacc_0 = mul_sum_us8_pairs_acc_int32x8(iacc_0, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_03, 177), rhs_vec_4567_03, 170), _mm256_shuffle_epi32(lhs_vec_01, 255));
+
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(rhs_vec_0123_10, _mm256_shuffle_epi32(rhs_vec_4567_10, 177), 170), _mm256_shuffle_epi32(lhs_vec_10,   0));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_10, 177), rhs_vec_4567_10, 170), _mm256_shuffle_epi32(lhs_vec_10,  85));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(rhs_vec_0123_11, _mm256_shuffle_epi32(rhs_vec_4567_11, 177), 170), _mm256_shuffle_epi32(lhs_vec_10, 170));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_11, 177), rhs_vec_4567_11, 170), _mm256_shuffle_epi32(lhs_vec_10, 255));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(rhs_vec_0123_12, _mm256_shuffle_epi32(rhs_vec_4567_12, 177), 170), _mm256_shuffle_epi32(lhs_vec_11,   0));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_12, 177), rhs_vec_4567_12, 170), _mm256_shuffle_epi32(lhs_vec_11,  85));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(rhs_vec_0123_13, _mm256_shuffle_epi32(rhs_vec_4567_13, 177), 170), _mm256_shuffle_epi32(lhs_vec_11, 170));
+                    iacc_1 = mul_sum_us8_pairs_acc_int32x8(iacc_1, _mm256_blend_epi32(_mm256_shuffle_epi32(rhs_vec_0123_13, 177), rhs_vec_4567_13, 170), _mm256_shuffle_epi32(lhs_vec_11, 255));
+
+                    // scalemask duplicates each scale for the legacy i16 pair reduction. Select
+                    // one copy in the same B0,B4,B1,B5,B2,B6,B3,B7 lane order used by VNNI.
+                    const __m128i scale32mask = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
+                                                             -1, -1, -1, -1, -1, -1, -1, -1);
+                    const __m256i scales_0_32 = _mm256_cvtepu8_epi32(_mm_shuffle_epi8(scales_rearrange_0, scale32mask));
+                    const __m256i scales_1_32 = _mm256_cvtepu8_epi32(_mm_shuffle_epi8(scales_rearrange_1, scale32mask));
+                    iacc_sb = _mm256_add_epi32(_mm256_mullo_epi32(iacc_0, scales_0_32),
+                                              _mm256_mullo_epi32(iacc_1, scales_1_32));
+#else
+                    const __m256i scales_0 = _mm256_cvtepu8_epi16(scales_rearrange_0);
+                    const __m256i scales_1 = _mm256_cvtepu8_epi16(scales_rearrange_1);
                     __m256i iacc_0 = _mm256_setzero_si256();
                     __m256i iacc_1 = _mm256_setzero_si256();
 
@@ -1651,7 +1687,8 @@ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     iacc_1 = _mm256_madd_epi16(iacc_1, scales_1);
 
                     // Accumulate the iacc value for one sb
-                    __m256i iacc_sb = _mm256_add_epi32(iacc_0, iacc_1);
+                    iacc_sb = _mm256_add_epi32(iacc_0, iacc_1);
+#endif
 
                     // Broadcast the bsums of the two sub blocks  of the iteration of Q8_K across the vector
                     // Multiply-Add with corresponding mins of Q4_Kx8 with bsums

@@ -164,6 +164,10 @@ if (NOT MSVC)
     # in MSVC F16C and FMA is implied with AVX2/AVX512
     option(GGML_FMA          "ggml: enable FMA"              ${INS_ENB})
     option(GGML_F16C         "ggml: enable F16C"             ${INS_ENB})
+    option(GGML_AVX_VNNI_INT8  "ggml: enable AVX-VNNI-INT8"  OFF)
+    option(GGML_AVX_VNNI_INT16 "ggml: enable AVX-VNNI-INT16" OFF)
+    option(GGML_AVX_NE_CONVERT  "ggml: enable AVX-NE-CONVERT" OFF)
+    option(GGML_AVX_IFMA        "ggml: enable AVX-IFMA"       OFF)
     # MSVC does not seem to support AMX
     option(GGML_AMX_TILE     "ggml: enable AMX-TILE"         OFF)
     option(GGML_AMX_INT8     "ggml: enable AMX-INT8"         OFF)
