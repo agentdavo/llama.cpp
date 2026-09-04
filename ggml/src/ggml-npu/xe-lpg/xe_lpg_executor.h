@@ -16,6 +16,9 @@ typedef struct {
     uint64_t gate_tensor_id;
     uint64_t up_tensor_id;
     uint64_t down_tensor_id;
+    uint64_t gate_stride;
+    uint64_t up_stride;
+    uint64_t down_stride;
     uint32_t layer;
     uint32_t gate_type;
     uint32_t up_type;
@@ -51,10 +54,13 @@ typedef struct {
     uint64_t failures;
 } xe_lpg_profile;
 
-xe_lpg_executor *xe_lpg_executor_create(const char *module_path, size_t cache_bytes);
+xe_lpg_executor *xe_lpg_executor_create(
+        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32]);
 void xe_lpg_executor_destroy(xe_lpg_executor *executor);
 const char *xe_lpg_executor_error(const xe_lpg_executor *executor);
 void xe_lpg_executor_profile(const xe_lpg_executor *executor, xe_lpg_profile *profile);
+uint32_t xe_lpg_executor_capacity(const xe_lpg_executor *executor);
+int xe_lpg_executor_prefill(xe_lpg_executor *executor, const xe_lpg_expert *experts, uint32_t count);
 
 xe_lpg_replay_status xe_lpg_executor_replay(
         xe_lpg_executor *executor,
@@ -62,7 +68,9 @@ xe_lpg_replay_status xe_lpg_executor_replay(
         const void *input_q8_k,
         const float *expected_gate,
         const float *expected_up,
-        const float expected_down[25600]);
+        const float *expected_down,
+        float *output_down,
+        int allow_fill);
 
 #ifdef __cplusplus
 }

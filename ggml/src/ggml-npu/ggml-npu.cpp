@@ -414,6 +414,9 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         trace_nodes = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
 
+#if defined(GGML_NPU_XE_LPG)
+    bool xe_lpg_bypass = false;
+#endif
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (trace_nodes) {
@@ -427,17 +430,47 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
 
 #if defined(GGML_NPU_XE_LPG)
         const int xe_lpg_role = ggml_backend_npu_xe_lpg_role(ctx->xe_lpg, node);
-        if (xe_lpg_role) {
+        if (xe_lpg_bypass) {
+            if (xe_lpg_role == 3) xe_lpg_bypass = false;
+        } else if (xe_lpg_role) {
             flush_dpu();
             if (xe_lpg_role == 1) flush_cpu();
-            ggml_backend_npu_xe_lpg_capture(ctx->xe_lpg, node, xe_lpg_role);
-            if (batch->n_nodes >= batch_cap) flush_cpu();
-            batch->nodes[batch->n_nodes++] = node;
-            if (xe_lpg_role == 3) {
-                flush_cpu();
-                ggml_backend_npu_xe_lpg_complete(ctx->xe_lpg, node);
+            if (xe_lpg_role == 1) {
+                const int replace = ggml_backend_npu_xe_lpg_begin_replace(ctx->xe_lpg, cgraph, i);
+                if (replace > 0) {
+                    struct ggml_tensor * down = cgraph->nodes[i + 3];
+                    if (ggml_backend_npu_xe_lpg_replace(ctx->xe_lpg, down)) {
+                        i += 3;
+                        continue;
+                    }
+                    GGML_ASSERT(batch->n_nodes == 0);
+                    GGML_ASSERT(batch_cap >= 4);
+                    for (int held = 0; held < 4; ++held) {
+                        if (batch->n_nodes >= batch_cap) flush_cpu();
+                        batch->nodes[batch->n_nodes++] = cgraph->nodes[i + held];
+                    }
+                    flush_cpu();
+                    ggml_backend_npu_xe_lpg_abort(ctx->xe_lpg);
+                    i += 3;
+                    continue;
+                }
+                if (replace < 0) {
+                    ggml_backend_npu_xe_lpg_abort(ctx->xe_lpg);
+                    xe_lpg_bypass = true;
+                }
             }
-            continue;
+            if (xe_lpg_bypass) {
+                // The current CPU node falls through to the normal classifier.
+            } else {
+                ggml_backend_npu_xe_lpg_capture(ctx->xe_lpg, node, xe_lpg_role);
+                if (batch->n_nodes >= batch_cap) flush_cpu();
+                batch->nodes[batch->n_nodes++] = node;
+                if (xe_lpg_role == 3) {
+                    flush_cpu();
+                    ggml_backend_npu_xe_lpg_complete(ctx->xe_lpg, node);
+                }
+                continue;
+            }
         }
 #endif
 

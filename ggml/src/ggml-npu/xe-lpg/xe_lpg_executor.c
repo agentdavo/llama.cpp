@@ -1,7 +1,9 @@
 #define ZE_GPU_IMPLEMENTATION
 #include "ze_gpu.h"
 #include "xe_lpg_executor.h"
+#include "sha256/sha256.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,13 +36,16 @@ struct xe_lpg_executor {
     uint32_t capacity;
     uint64_t clock;
     xe_lpg_profile profile;
+    atomic_flag busy;
+    int full_dirty;
     char error[512];
 };
 
 static int key_equal(const xe_lpg_expert_key *a, const xe_lpg_expert_key *b) {
     return a->model_id == b->model_id && a->epoch == b->epoch &&
            a->gate_tensor_id == b->gate_tensor_id && a->up_tensor_id == b->up_tensor_id &&
-           a->down_tensor_id == b->down_tensor_id && a->layer == b->layer &&
+           a->down_tensor_id == b->down_tensor_id && a->gate_stride == b->gate_stride &&
+           a->up_stride == b->up_stride && a->down_stride == b->down_stride && a->layer == b->layer &&
            a->gate_type == b->gate_type && a->up_type == b->up_type &&
            a->down_type == b->down_type && a->layout == b->layout &&
            a->expert == b->expert && a->input_width == b->input_width &&
@@ -111,28 +116,103 @@ static int fill_slot(xe_lpg_executor *executor, uint32_t slot, const xe_lpg_expe
     return 0;
 }
 
-xe_lpg_executor *xe_lpg_executor_create(const char *module_path, size_t cache_bytes) {
+static int resolve_slots(
+        xe_lpg_executor *executor, const xe_lpg_expert *experts, uint32_t count,
+        uint32_t *slot_ids, int allow_fill) {
+    uint8_t *protected_slots = NULL;
+    if (!executor || !experts || count == 0 || count > executor->capacity) return -1;
+    protected_slots = (uint8_t *)calloc(executor->capacity, 1);
+    if (!protected_slots) return fail(executor, "cache protection allocation");
+    for (uint32_t rank = 0; rank < count; ++rank) {
+        uint32_t slot = executor->capacity;
+        if (find_slot(executor, &experts[rank].key, &slot)) {
+            executor->profile.hits++;
+            executor->slots[slot].age = ++executor->clock;
+        } else {
+            if (!allow_fill) {
+                free(protected_slots);
+                return 1;
+            }
+            slot = choose_slot(executor, protected_slots);
+            if (slot == executor->capacity || fill_slot(executor, slot, &experts[rank])) {
+                free(protected_slots);
+                return -1;
+            }
+        }
+        protected_slots[slot] = 1;
+        if (slot_ids) slot_ids[rank] = slot;
+    }
+    free(protected_slots);
+    return 0;
+}
+
+xe_lpg_executor *xe_lpg_executor_create(
+        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32]) {
     xe_lpg_executor *executor = NULL;
     unsigned char *module = NULL;
     size_t module_bytes = 0;
-    if (!module_path || cache_bytes < (size_t)XE_ROUTES * XE_TRIPLET_BYTES ||
-        read_module(module_path, &module, &module_bytes)) return NULL;
+    if (!module_path) {
+        fprintf(stderr, "xe-lpg: executor create failed: no module path\n");
+        return NULL;
+    }
+    if (cache_bytes < (size_t)XE_ROUTES * XE_TRIPLET_BYTES) {
+        fprintf(stderr, "xe-lpg: executor create failed: cache is smaller than one route\n");
+        return NULL;
+    }
+    if (read_module(module_path, &module, &module_bytes)) {
+        fprintf(stderr, "xe-lpg: executor create failed: cannot read module\n");
+        return NULL;
+    }
+    if (expected_sha256) {
+        unsigned char actual[SHA256_DIGEST_SIZE];
+        sha256_hash(actual, module, module_bytes);
+        if (memcmp(actual, expected_sha256, sizeof actual)) {
+            fprintf(stderr, "xe-lpg: executor create failed: module SHA-256 mismatch\n");
+            goto error;
+        }
+    }
     executor = (xe_lpg_executor *)calloc(1, sizeof *executor);
-    if (!executor) goto error;
+    if (!executor) {
+        fprintf(stderr, "xe-lpg: executor create failed: host allocation\n");
+        goto error;
+    }
+    atomic_flag_clear_explicit(&executor->busy, memory_order_release);
     size_t capacity = cache_bytes / XE_TRIPLET_BYTES;
     if (capacity > 512) capacity = 512;
     executor->capacity = (uint32_t)capacity;
     executor->slots = (xe_lpg_slot *)calloc(capacity, sizeof *executor->slots);
-    if (!executor->slots || ze_gpu_open(&executor->gpu, 0) ||
-        ze_gpu_program_create(&executor->gpu, ZE_MODULE_FORMAT_NATIVE, module, module_bytes, "gate_up", NULL, &executor->gate) ||
-        ze_gpu_program_create(&executor->gpu, ZE_MODULE_FORMAT_NATIVE, module, module_bytes, "quantize_q8_1", NULL, &executor->quant) ||
-        ze_gpu_program_create(&executor->gpu, ZE_MODULE_FORMAT_NATIVE, module, module_bytes, "down_q5", NULL, &executor->down)) goto error;
+    if (!executor->slots) {
+        fprintf(stderr, "xe-lpg: executor create failed: slot metadata allocation\n");
+        goto error;
+    }
+    if (ze_gpu_open(&executor->gpu, 0)) {
+        fprintf(stderr, "xe-lpg: executor create failed: GPU open: %s\n", executor->gpu.error);
+        goto error;
+    }
+    if (ze_gpu_program_create(&executor->gpu, ZE_MODULE_FORMAT_NATIVE, module, module_bytes, "gate_up", NULL, &executor->gate)) {
+        fprintf(stderr, "xe-lpg: executor create failed: gate/up module: %s\n", executor->gpu.error);
+        goto error;
+    }
+    if (ze_gpu_program_create(&executor->gpu, ZE_MODULE_FORMAT_NATIVE, module, module_bytes, "quantize_q8_1", NULL, &executor->quant)) {
+        fprintf(stderr, "xe-lpg: executor create failed: quantize module: %s\n", executor->gpu.error);
+        goto error;
+    }
+    if (ze_gpu_program_create(&executor->gpu, ZE_MODULE_FORMAT_NATIVE, module, module_bytes, "down_q5", NULL, &executor->down)) {
+        fprintf(stderr, "xe-lpg: executor create failed: down module: %s\n", executor->gpu.error);
+        goto error;
+    }
     const size_t sizes[10] = {
         capacity * XE_GATE_BYTES, capacity * XE_UP_BYTES, capacity * XE_DOWN_BYTES,
         2920, 40, (6400 + 32) * sizeof(float), (6400 + 32) * sizeof(float),
         (6400 + 32) * sizeof(float), 7200, (25600 + 32) * sizeof(float),
     };
-    for (uint32_t i = 0; i < 10; ++i) if (ze_gpu_buffer_alloc(&executor->gpu, sizes[i], &executor->buffers[i])) goto error;
+    for (uint32_t i = 0; i < 10; ++i) {
+        if (ze_gpu_buffer_alloc(&executor->gpu, sizes[i], &executor->buffers[i])) {
+            fprintf(stderr, "xe-lpg: executor create failed: buffer %u (%zu bytes): %s\n",
+                    i, sizes[i], executor->gpu.error);
+            goto error;
+        }
+    }
     free(module);
     return executor;
 error:
@@ -143,7 +223,7 @@ error:
 
 void xe_lpg_executor_destroy(xe_lpg_executor *executor) {
     if (!executor) return;
-    if (executor->gpu.pending) (void)ze_gpu_wait(&executor->gpu, 10000000000ull);
+    if (executor->gpu.pending || executor->gpu.recorded) (void)ze_gpu_wait(&executor->gpu, 10000000000ull);
     for (uint32_t i = 0; i < 10; ++i) (void)ze_gpu_buffer_free(&executor->buffers[i]);
     (void)ze_gpu_program_destroy(&executor->down);
     (void)ze_gpu_program_destroy(&executor->quant);
@@ -161,30 +241,43 @@ void xe_lpg_executor_profile(const xe_lpg_executor *executor, xe_lpg_profile *pr
     if (profile) *profile = executor ? executor->profile : (xe_lpg_profile){0};
 }
 
-xe_lpg_replay_status xe_lpg_executor_replay(
-        xe_lpg_executor *executor, const xe_lpg_expert experts[XE_ROUTES], const void *input_q8_k,
-        const float *expected_gate, const float *expected_up, const float expected_down[25600]) {
-    uint32_t slot_ids[XE_ROUTES];
-    uint8_t *protected_slots = NULL;
-    if (!executor || !experts || !input_q8_k || !expected_down) return XE_LPG_REPLAY_UNAVAILABLE;
-    protected_slots = (uint8_t *)calloc(executor->capacity, 1);
-    if (!protected_slots) { fail(executor, "cache protection allocation"); return XE_LPG_REPLAY_UNAVAILABLE; }
-    for (uint32_t rank = 0; rank < XE_ROUTES; ++rank) {
-        uint32_t slot = executor->capacity;
-        if (find_slot(executor, &experts[rank].key, &slot)) {
-            executor->profile.hits++;
-            executor->slots[slot].age = ++executor->clock;
-        } else {
-            slot = choose_slot(executor, protected_slots);
-            if (slot == executor->capacity || fill_slot(executor, slot, &experts[rank])) {
-                free(protected_slots);
-                return XE_LPG_REPLAY_UNAVAILABLE;
-            }
-        }
-        protected_slots[slot] = 1;
-        slot_ids[rank] = slot;
+uint32_t xe_lpg_executor_capacity(const xe_lpg_executor *executor) {
+    return executor ? executor->capacity : 0;
+}
+
+static int executor_lock(xe_lpg_executor *executor) {
+    if (!executor) return -1;
+    if (atomic_flag_test_and_set_explicit(&executor->busy, memory_order_acquire))
+        return fail(executor, "concurrent executor use");
+    return 0;
+}
+
+static void executor_unlock(xe_lpg_executor *executor) {
+    atomic_flag_clear_explicit(&executor->busy, memory_order_release);
+}
+
+int xe_lpg_executor_prefill(xe_lpg_executor *executor, const xe_lpg_expert *experts, uint32_t count) {
+    if (executor_lock(executor)) return -1;
+    int result = -1;
+    if (executor->gpu.pending || executor->gpu.recorded) {
+        (void)fail(executor, "prefill requires an idle queue");
+    } else if (resolve_slots(executor, experts, count, NULL, 1) == 0) {
+        if (count == executor->capacity) executor->full_dirty = 1;
+        result = 0;
     }
-    free(protected_slots);
+    executor_unlock(executor);
+    return result;
+}
+
+static xe_lpg_replay_status replay_locked(
+        xe_lpg_executor *executor, const xe_lpg_expert experts[XE_ROUTES], const void *input_q8_k,
+        const float *expected_gate, const float *expected_up, const float *expected_down,
+        float *output_down, int allow_fill) {
+    uint32_t slot_ids[XE_ROUTES];
+    if (!executor || !experts || !input_q8_k || (!expected_down && !output_down)) return XE_LPG_REPLAY_UNAVAILABLE;
+    const int resolved = resolve_slots(executor, experts, XE_ROUTES, slot_ids, allow_fill);
+    if (resolved > 0) return XE_LPG_REPLAY_WARMING;
+    if (resolved < 0) return XE_LPG_REPLAY_UNAVAILABLE;
     memcpy(executor->buffers[3].data, input_q8_k, 2920);
     memcpy(executor->buffers[4].data, slot_ids, sizeof slot_ids);
     const uint32_t one = 1;
@@ -207,13 +300,24 @@ xe_lpg_replay_status xe_lpg_executor_replay(
     size_t range_sizes[2 + 3 * 512];
     const void *ranges[2 + 3 * 512];
     uint32_t range_count = 0;
-    for (uint32_t slot = 0; slot < executor->capacity; ++slot) if (executor->slots[slot].dirty) {
-        const size_t bytes[3] = {XE_GATE_BYTES, XE_UP_BYTES, XE_DOWN_BYTES};
+    if (executor->full_dirty) {
         for (uint32_t role = 0; role < 3; ++role) {
-            range_sizes[range_count] = bytes[role];
-            ranges[range_count++] = (const unsigned char *)executor->buffers[role].data + (size_t)slot * bytes[role];
+            range_sizes[range_count] = executor->buffers[role].size;
+            ranges[range_count++] = executor->buffers[role].data;
         }
-        executor->slots[slot].dirty = 0;
+        fprintf(stderr, "xe-lpg: full-cache coherency ranges=3 gate=%zu up=%zu down=%zu bytes\n",
+                executor->buffers[0].size, executor->buffers[1].size, executor->buffers[2].size);
+        for (uint32_t slot = 0; slot < executor->capacity; ++slot) executor->slots[slot].dirty = 0;
+        executor->full_dirty = 0;
+    } else {
+        for (uint32_t slot = 0; slot < executor->capacity; ++slot) if (executor->slots[slot].dirty) {
+            const size_t bytes[3] = {XE_GATE_BYTES, XE_UP_BYTES, XE_DOWN_BYTES};
+            for (uint32_t role = 0; role < 3; ++role) {
+                range_sizes[range_count] = bytes[role];
+                ranges[range_count++] = (const unsigned char *)executor->buffers[role].data + (size_t)slot * bytes[role];
+            }
+            executor->slots[slot].dirty = 0;
+        }
     }
     range_sizes[range_count] = executor->buffers[3].size; ranges[range_count++] = executor->buffers[3].data;
     range_sizes[range_count] = executor->buffers[4].size; ranges[range_count++] = executor->buffers[4].data;
@@ -231,13 +335,36 @@ xe_lpg_replay_status xe_lpg_executor_replay(
         ze_gpu_wait(&executor->gpu, 10000000000ull)) goto gpu_fail;
     if ((expected_gate && memcmp(executor->buffers[5].data, expected_gate, 6400 * sizeof(float))) ||
         (expected_up && memcmp(executor->buffers[6].data, expected_up, 6400 * sizeof(float))) ||
-        memcmp(executor->buffers[9].data, expected_down, 25600 * sizeof(float))) {
+        (expected_down && memcmp(executor->buffers[9].data, expected_down, 25600 * sizeof(float)))) {
         executor->profile.mismatches++;
         return XE_LPG_REPLAY_MISMATCH;
+    }
+    if (output_down) {
+        unsigned char digest[SHA256_DIGEST_SIZE];
+        memcpy(output_down, executor->buffers[9].data, 25600 * sizeof(float));
+        if (memcmp(output_down, executor->buffers[9].data, 25600 * sizeof(float))) {
+            (void)fail(executor, "replacement output copy verification");
+            return XE_LPG_REPLAY_UNAVAILABLE;
+        }
+        sha256_hash(digest, (const unsigned char *)output_down, 25600 * sizeof(float));
+        fprintf(stderr, "xe-lpg: replacement output propagated sha256=");
+        for (uint32_t i = 0; i < SHA256_DIGEST_SIZE; ++i) fprintf(stderr, "%02x", digest[i]);
+        fputc('\n', stderr);
     }
     executor->profile.exact_replays++;
     return XE_LPG_REPLAY_EXACT;
 gpu_fail:
     fail(executor, "Level Zero replay");
     return XE_LPG_REPLAY_UNAVAILABLE;
+}
+
+xe_lpg_replay_status xe_lpg_executor_replay(
+        xe_lpg_executor *executor, const xe_lpg_expert experts[XE_ROUTES], const void *input_q8_k,
+        const float *expected_gate, const float *expected_up, const float *expected_down,
+        float *output_down, int allow_fill) {
+    if (executor_lock(executor)) return XE_LPG_REPLAY_UNAVAILABLE;
+    const xe_lpg_replay_status result = replay_locked(
+            executor, experts, input_q8_k, expected_gate, expected_up, expected_down, output_down, allow_fill);
+    executor_unlock(executor);
+    return result;
 }
