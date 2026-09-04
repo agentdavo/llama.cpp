@@ -528,6 +528,62 @@ ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const floa
     return sum/n;
 }
 
+void ggml_vec_sigmoid_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 zero = _mm512_setzero_ps();
+    for (; i + 15 < n; i += 16) {
+        const __m512 xv = _mm512_loadu_ps(x + i);
+        const __m512 ev = ggml_v_expf(_mm512_sub_ps(zero, xv));
+        _mm512_storeu_ps(y + i, _mm512_div_ps(one, _mm512_add_ps(one, ev)));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 zero = _mm256_setzero_ps();
+    for (; i + 7 < n; i += 8) {
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        const __m256 ev = ggml_v_expf(_mm256_sub_ps(zero, xv));
+        _mm256_storeu_ps(y + i, _mm256_div_ps(one, _mm256_add_ps(one, ev)));
+    }
+#elif defined(__SSE2__)
+    const __m128 one = _mm_set1_ps(1.0f);
+    const __m128 zero = _mm_setzero_ps();
+    for (; i + 3 < n; i += 4) {
+        const __m128 xv = _mm_loadu_ps(x + i);
+        const __m128 ev = ggml_v_expf(_mm_sub_ps(zero, xv));
+        _mm_storeu_ps(y + i, _mm_div_ps(one, _mm_add_ps(one, ev)));
+    }
+#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    const int vlen = svcntw();
+    for (; i < n; i += vlen) {
+        const svbool_t pg = svwhilelt_b32_s32(i, n);
+        const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
+        const svfloat32_t xv = svld1_f32(pg, x + i);
+        const svfloat32_t ev = ggml_v_expf(pg, svneg_f32_x(pg, xv));
+        svst1_f32(pg, y + i, svdiv_f32_x(pg, one, svadd_f32_x(pg, one, ev)));
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    for (; i + 3 < n; i += 4) {
+        const float32x4_t xv = vld1q_f32(x + i);
+        const float32x4_t ev = ggml_v_expf(vnegq_f32(xv));
+        vst1q_f32(y + i, vdivq_f32(one, vaddq_f32(one, ev)));
+    }
+#elif defined(__riscv_v_intrinsic)
+    for (int avl; i < n; i += avl) {
+        avl = __riscv_vsetvl_e32m2(n - i);
+        const vfloat32m2_t xv = __riscv_vle32_v_f32m2(x + i, avl);
+        const vfloat32m2_t ev = ggml_v_expf_m2(__riscv_vfneg_v_f32m2(xv, avl), avl);
+        const vfloat32m2_t den = __riscv_vfadd_vf_f32m2(ev, 1.0f, avl);
+        __riscv_vse32_v_f32m2(y + i, __riscv_vfrdiv_vf_f32m2(den, 1.0f, avl), avl);
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = 1.0f/(1.0f + expf(-x[i]));
+    }
+}
+
 ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max) {
     int i = 0;
     ggml_float sum = 0;

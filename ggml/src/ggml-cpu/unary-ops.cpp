@@ -1,4 +1,5 @@
 #include "unary-ops.h"
+#include "vec.h"
 
 static inline float op_abs(float x) {
     return fabsf(x);
@@ -263,6 +264,53 @@ void ggml_compute_forward_relu(const ggml_compute_params * params, ggml_tensor *
 }
 
 void ggml_compute_forward_sigmoid(const ggml_compute_params * params, ggml_tensor * dst) {
+    static const bool fast_sigmoid = getenv("GGML_CPU_FAST_SIGMOID") != nullptr;
+    const ggml_tensor * src0 = dst->src[0];
+
+    if (fast_sigmoid && src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst) &&
+                    ggml_are_same_shape(src0, dst));
+
+        GGML_TENSOR_UNARY_OP_LOCALS
+
+        GGML_ASSERT(nb0 == sizeof(float));
+        GGML_ASSERT(nb00 == sizeof(float));
+
+        const int64_t nrows = ggml_nrows(src0);
+        if (nrows >= params->nth) {
+            const auto [ir0, ir1] = get_thread_range(params, src0);
+            for (int64_t ir = ir0; ir < ir1; ++ir) {
+                const int64_t i03 = ir/(ne02*ne01);
+                const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+                const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
+                float       * dst_ptr  = (float *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1);
+                const float * src0_ptr = (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+                ggml_vec_sigmoid_f32((int) ne0, dst_ptr, src0_ptr);
+            }
+        } else {
+            // Decode gates have one long row. Divide it into cache-line-sized
+            // pieces so every worker participates instead of leaving nth-1 idle.
+            constexpr int64_t chunk_size = 16;
+            const int64_t chunks_per_row = (ne0 + chunk_size - 1)/chunk_size;
+            const int64_t nchunks = nrows*chunks_per_row;
+            const int64_t chunks_per_thread = (nchunks + params->nth - 1)/params->nth;
+            const int64_t ic0 = chunks_per_thread*params->ith;
+            const int64_t ic1 = MIN(ic0 + chunks_per_thread, nchunks);
+
+            for (int64_t ic = ic0; ic < ic1; ++ic) {
+                const int64_t ir  = ic/chunks_per_row;
+                const int64_t col = (ic - ir*chunks_per_row)*chunk_size;
+                const int64_t i03 = ir/(ne02*ne01);
+                const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+                const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
+                float       * dst_ptr  = (float *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1) + col;
+                const float * src0_ptr = (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01) + col;
+                ggml_vec_sigmoid_f32((int) MIN(chunk_size, ne0 - col), dst_ptr, src0_ptr);
+            }
+        }
+        return;
+    }
+
     unary_op<op_sigmoid>(params, dst);
 }
 
