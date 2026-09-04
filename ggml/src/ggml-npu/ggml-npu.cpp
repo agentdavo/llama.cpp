@@ -271,13 +271,28 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     // lm_head, non-cacheable GEMMs) to the internal CPU backend — our buffers are host memory, so the
     // CPU computes them in place. Nodes are processed in order; the pending CPU batch is flushed before
     // each DPU op so data dependencies are honored.
+    // CAPACITY MUST COME FROM n_nodes, NOT size. ggml_backend_sched hands each backend a GRAPH VIEW
+    // (ggml-backend.cpp:1471 -> ggml_graph_view), and a view has `size = 0` by construction
+    // (ggml.c:7446) because it cannot grow. Sizing this scratch graph by cgraph->size therefore
+    // allocated a ZERO-CAPACITY node array, and `batch->nodes[batch->n_nodes++] = node` below wrote
+    // straight past it into the ggml context buffer.
+    //
+    // That was the STATUS_HEAP_CORRUPTION (0xC0000374): the out-of-bounds writes land in adjacent heap,
+    // so every flush "succeeds" and the process dies later — at ggml_free(gctx) freeing a smashed
+    // block, or at some unrelated allocation. It is also what the earlier "segfault at node[7900]"
+    // really was: 7900 node pointers written into a zero-capacity array.
+    //
+    // n_nodes is the exact bound: we append at most one entry per node of this graph, and flushes only
+    // ever reset n_nodes to 0. Guard the append anyway — silently corrupting the heap is the worst
+    // possible failure mode for a bound we believe is correct.
+    const int batch_cap = cgraph->n_nodes > 0 ? cgraph->n_nodes : 1;
     struct ggml_init_params ip = {
-        /* .mem_size   = */ ggml_graph_overhead_custom(cgraph->size, false) + ggml_tensor_overhead(),
+        /* .mem_size   = */ ggml_graph_overhead_custom(batch_cap, false) + ggml_tensor_overhead(),
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true,
     };
     struct ggml_context * gctx = ggml_init(ip);
-    struct ggml_cgraph * batch = ggml_new_graph_custom(gctx, cgraph->size, false);
+    struct ggml_cgraph * batch = ggml_new_graph_custom(gctx, batch_cap, false);
 
     // Independent consecutive DPU mul_mats (q/k/v share the norm input; gate/up share theirs) are
     // collected and submitted as ONE queue execute + sync (hpi_q8_0_gemm_batch), amortizing the per-op
@@ -377,6 +392,9 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 flush_cpu();                           // experts read CPU-computed activations -> flush first
                 ggml_backend_npu_mul_mat_id(ctx, node);   // MoE experts on the DPU (one batched submit per token)
             } else {
+                if (batch->n_nodes >= batch_cap) {        // must never happen (cap == n_nodes); never corrupt if it does
+                    flush_cpu();
+                }
                 batch->nodes[batch->n_nodes++] = node;   // everything else (incl. sub-8-bit experts) -> CPU passthrough
             }
         }
