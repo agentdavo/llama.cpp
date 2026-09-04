@@ -53,13 +53,18 @@ const scheme SCHEMES[] = {
     { "i4/128",  4, 128 },
     { "i4/64",   4,  64 },
     { "i4/32",   4,  32 },
+    { "i6/row",  6,   0 },   // 6-bit-in-8: |q| <= 31 in a byte, for the DMA dec_en path
+    { "i6/256",  6, 256 },
 };
 const int N_SCHEMES = (int) (sizeof(SCHEMES) / sizeof(SCHEMES[0]));
 
 // DDR cost of a scheme in bits per weight: the integer plus one fp16 scale per group.
 double scheme_bpw(const scheme & s, int64_t K) {
     const double g = s.G == 0 ? (double) K : (double) s.G;
-    return (double) s.bits + 16.0 / g;
+    // i6 is stored one code per byte; only the DMA decompressor (dec_en) earns the 2 bits back, so
+    // its DDR cost is measured with bitc_enc, not predicted here.
+    const double store = s.bits == 6 ? 8.0 : (double) s.bits;
+    return store + 16.0 / g;
 }
 
 // Squared error of requantising one row under a scheme. Symmetric, no zero point: an asymmetric
@@ -407,7 +412,16 @@ int main(int argc, char ** argv) {
             const std::string base = std::string(raw_dir) + "/" + name;
             FILE * fi8 = fopen((base + ".i8").c_str(), "wb");
             FILE * f32 = fopen((base + ".f32").c_str(), "wb");
-            if (!fi8 || !f32) { fprintf(stderr, "  cannot write %s.*\n", base.c_str()); if (fi8) fclose(fi8); if (f32) fclose(f32); continue; }
+            // .f16 and .src are the reference-vector pair a dequant-kernel author diffs against:
+            // the ggml to_float output as row-major fp16, and the packed source bytes it came from.
+            FILE * f16 = fopen((base + ".f16").c_str(), "wb");
+            FILE * fsrc = fopen((base + ".src").c_str(), "wb");
+            if (!fi8 || !f32 || !f16 || !fsrc) {
+                fprintf(stderr, "  cannot write %s.*\n", base.c_str());
+                if (fi8) fclose(fi8); if (f32) fclose(f32); if (f16) fclose(f16); if (fsrc) fclose(fsrc);
+                continue;
+            }
+            std::vector<ggml_fp16_t> h((size_t) K);
 
             bool ok = fseeko64(f, (off64_t) (data_off + gguf_get_tensor_offset(ctx, t)), SEEK_SET) == 0;
             for (int64_t n = 0; ok && n < N; n++) {
@@ -424,11 +438,17 @@ int main(int argc, char ** argv) {
                     if (v < -127) v = -127;
                     q[i] = (int8_t) v;
                 }
-                if (fwrite(q.data(), 1, (size_t) K, fi8) != (size_t) K) { ok = false; break; }
-                if (fwrite(w.data(), 4, (size_t) K, f32) != (size_t) K) { ok = false; break; }
+                for (int64_t i = 0; i < K; i++) h[(size_t) i] = ggml_fp32_to_fp16(w[(size_t) i]);
+
+                if (fwrite(q.data(), 1, (size_t) K, fi8)  != (size_t) K) { ok = false; break; }
+                if (fwrite(w.data(), 4, (size_t) K, f32)  != (size_t) K) { ok = false; break; }
+                if (fwrite(h.data(), 2, (size_t) K, f16)  != (size_t) K) { ok = false; break; }
+                if (fwrite(rb.data(), 1, row_bytes, fsrc) != row_bytes)  { ok = false; break; }
             }
             fclose(fi8);
             fclose(f32);
+            fclose(f16);
+            fclose(fsrc);
             if (!ok) { fprintf(stderr, "  FAILED on %s\n", name); continue; }
 
             FILE * fs = fopen((base + ".sw").c_str(), "wb");
