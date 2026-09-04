@@ -108,3 +108,33 @@ is already included in `cpu_ms`; do not add it again. `overlap_candidates` count
 eligible CPU nodes, including candidates paired with cache misses. These are host
 scopes, not hardware-engine overlap counters. Smaller remaining wait time alone
 does not establish faster inference; compare total wall time and output correctness.
+
+### Xe-LPG Level Zero shadow replay
+
+`GGML_NPU_XE_LPG` compiles a disabled-by-default Xe-LPG replay path in a
+`GGML_NPU_HW` build. Runtime activation also requires both of these variables:
+
+```text
+GGML_NPU_XE_LPG_SHADOW=1
+GGML_NPU_XE_LPG_MODULE=<exact native Level Zero module>
+```
+
+`GGML_NPU_XE_LPG_CACHE_MIB` selects the packed expert cache budget (512 MiB by
+default). `GGML_NPU_XE_LPG_SHADOW_BLOCK` selects one layer (block 0 by default).
+The cache key includes model and epoch identity, all three tensor identities,
+layer, storage types, layout, expert ID, and matrix dimensions. Active route
+slots cannot be evicted.
+
+The current bounded gate accepts only the Flash-Next layout used by the local
+validation model: Q4_K gate/up `[2560,640,512]`, Q5_1 down
+`[640,2560,512]`, ten selected experts, and one to four token rows. It reads
+expert data with the actual ggml 3-D tensor stride. The host quantizes each
+input row to Q8_K, then Level Zero replays gate, up, exact SiLU, Q8_1
+quantization, and down. It compares every down float bit-for-bit with the CPU
+result.
+
+This path does not advertise an operation through `supports_op`, alter tensor
+placement, or replace a graph result. CPU output remains authoritative. An
+invalid configuration, unsupported shape, bad expert ID, cache failure, device
+failure, or numerical mismatch skips or disables replay without changing model
+execution. The native module is driver-specific and must be supplied explicitly.

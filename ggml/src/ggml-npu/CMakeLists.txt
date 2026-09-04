@@ -15,6 +15,7 @@ ggml_add_backend_library(ggml-npu
 target_include_directories(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 option(GGML_NPU_HW "ggml-npu: compile the real VPU-3720 hardware path (Windows x64 + NPU + src/ toolkit)" OFF)
+option(GGML_NPU_XE_LPG "ggml-npu: compile the disabled-by-default Xe-LPG Level Zero shadow replay" OFF)
 if (GGML_NPU_HW)
     # hpi_npu_3720.c owns the src/npu.h implementation (NPU_IMPLEMENTATION) and needs the full Level
     # Zero layer, so it requires the direct-access toolkit and the L0 / NPU-extension headers on the
@@ -41,4 +42,12 @@ if (GGML_NPU_HW)
     # backend stays honest (reports unavailable, AUTO falls back to the CPU reference).
     #   target_compile_definitions(ggml-npu PRIVATE HPI_NPU3720_BLOB_READY)
     #   target_sources(ggml-npu PRIVATE ${NPU_BLOB_IMPL})
+endif()
+
+if (GGML_NPU_XE_LPG)
+    if (NOT GGML_NPU_HW)
+        message(FATAL_ERROR "GGML_NPU_XE_LPG requires GGML_NPU_HW")
+    endif()
+    target_compile_definitions(ggml-npu PRIVATE GGML_NPU_XE_LPG)
+    target_sources(ggml-npu PRIVATE ggml-npu-xe-lpg.cpp xe-lpg/xe_lpg_executor.c)
 endif()

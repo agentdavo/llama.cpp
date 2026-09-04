@@ -18,6 +18,9 @@
 
 #include "hpi-3720/hpi.h"
 #include "ggml-npu-deps.h"
+#if defined(GGML_NPU_XE_LPG)
+#include "ggml-npu-xe-lpg.h"
+#endif
 
 #include <cstring>
 #include <cstdio>
@@ -39,6 +42,9 @@ struct ggml_backend_npu_context {
     int64_t      max_m     = 0;   // largest M seen (diagnose prefill batching)
     bool         logged_first = false;
     uint64_t     profile_graphs = 0;
+#if defined(GGML_NPU_XE_LPG)
+    ggml_backend_npu_xe_lpg * xe_lpg = nullptr;
+#endif
 };
 
 // CMX FIT — MUST MIRROR re/build_blob_cache.py's cmx_need()/CMX_BUDGET EXACTLY.
@@ -419,6 +425,22 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         }
         if (node->op == GGML_OP_NONE) continue;
 
+#if defined(GGML_NPU_XE_LPG)
+        const int xe_lpg_role = ggml_backend_npu_xe_lpg_role(ctx->xe_lpg, node);
+        if (xe_lpg_role) {
+            flush_dpu();
+            if (xe_lpg_role == 1) flush_cpu();
+            ggml_backend_npu_xe_lpg_capture(ctx->xe_lpg, node, xe_lpg_role);
+            if (batch->n_nodes >= batch_cap) flush_cpu();
+            batch->nodes[batch->n_nodes++] = node;
+            if (xe_lpg_role == 3) {
+                flush_cpu();
+                ggml_backend_npu_xe_lpg_complete(ctx->xe_lpg, node);
+            }
+            continue;
+        }
+#endif
+
         const bool batchable = ggml_backend_npu_dpu_cacheable(node) && node->ne[2] == 1 && node->ne[3] == 1;
         if (trace_nodes && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
             const struct ggml_tensor * s0 = node->src[0];
@@ -502,6 +524,9 @@ static void ggml_backend_npu_free(ggml_backend_t backend) {
         NPU_TRACE("backend ran %llu Q8_0 mul_mat op(s), %.3f GFLOP total\n",
                   (unsigned long long) ctx->n_mul_mat, (double) ctx->n_flop / 1e9);
         if (ctx->cpu) ggml_backend_free(ctx->cpu);
+#if defined(GGML_NPU_XE_LPG)
+        ggml_backend_npu_xe_lpg_destroy(ctx->xe_lpg);
+#endif
         hpi_close(ctx->hpi);
         delete ctx;
     }
@@ -567,6 +592,9 @@ ggml_backend_t ggml_backend_npu_init(void) {
             GGML_LOG_ERROR("%s: NPU_OFFLOAD_GPU set but ggml_backend_cpu_init() failed\n", __func__);
             hpi_close(ctx->hpi); delete ctx; return NULL;
         }
+#if defined(GGML_NPU_XE_LPG)
+        ctx->xe_lpg = ggml_backend_npu_xe_lpg_create(ctx);
+#endif
         GGML_LOG_INFO("%s: GPU-passthrough offload ON — whole layers via -ngl; cacheable Q8_0 mul_mats "
                       "on the DPU, all other ops on an internal CPU backend\n", __func__);
     }
