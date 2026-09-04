@@ -51,14 +51,15 @@ struct ggml_backend_npu_context {
 // sizeable GEMMs per token taken off the fast path and run on the slowest path available.
 //
 // So this is not an optimization; refusing what we cannot author is strictly better than claiming it.
-// If the K-split lands (PLAN item 3) these shapes become authorable and the predicate lets them back
-// in automatically — the two definitions just have to keep agreeing.
+// K-split support must update both the author and these predicates before admitting larger K.
 #define NPU_SLABCH     256                 // build_blob_cache.py SLABCH (its default, and our N%256 rule)
 #define NPU_CMX_BUDGET (1900u * 1024u)     // build_blob_cache.py CMX_BUDGET
+#define NPU_M1_K_MAX   8192                // measured unsliced limit; failure at 8208 is still unexplained
 
 static size_t ggml_backend_npu_cmx_need(int64_t K, int64_t N) {
     const size_t SB = (size_t) NPU_SLABCH * 16u + (size_t) NPU_SLABCH * (size_t) K;
-    const size_t s0 = ((size_t) 0x2000 + (size_t) N * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
+    const size_t out = ((size_t) K * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
+    const size_t s0 = (out + (size_t) N * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
     const size_t s1 = (s0 + SB + 0xFFFu) & ~(size_t) 0xFFFu;
     return s1 + SB;
 }
@@ -75,9 +76,10 @@ static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
     if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1], M = op->ne[1];
-    if (N % 256 != 0 || K % 32 != 0) return false;
+    if (K <= 0 || K > NPU_M1_K_MAX || N <= 0 || N > NPU_CMX_BUDGET / 2 || M <= 0) return false;
+    if (N % NPU_SLABCH != 0 || K % 32 != 0) return false;
     if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // authoring tool skips it -> so must we
-    if (M == 1) return true;                    // decode blob (any K)
+    if (M == 1) return true;                    // decode blob within measured K and CMX limits
     if (M <= 256 && (K == 1024 || K == 2048)) return true;   // prefill blob (fits CMX)
     return false;
 }
@@ -96,7 +98,8 @@ static bool ggml_backend_npu_mmid_cacheable(const struct ggml_tensor * op) {
     if (ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1];
-    if (N % 256 != 0 || K % 32 != 0) return false;
+    if (K <= 0 || K > NPU_M1_K_MAX || N <= 0 || N > NPU_CMX_BUDGET / 2) return false;
+    if (N % NPU_SLABCH != 0 || K % 32 != 0) return false;
     if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // same CMX limit as the 2D path
 
     // MEASURED 2026-09-04 (unsloth Qwen3.8-Flash-Next): claiming these is a NET LOSS today, so it is
