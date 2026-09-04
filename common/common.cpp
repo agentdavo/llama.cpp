@@ -436,7 +436,8 @@ void postprocess_cpu_params(
         const common_cpu_params * role_model,
         const char * role_name,
         bool throughput_role) {
-    const bool threads_were_auto = cpuparams.n_threads < 0;
+    const bool threads_requested_auto = cpuparams.n_threads < 0;
+    cpuparams.n_threads_auto = threads_requested_auto;
     const bool mask_was_explicit = cpuparams.mask_explicit;
     const enum common_cpu_core_policy requested_policy = cpuparams.core_policy;
     bool explicit_mask[GGML_MAX_N_THREADS];
@@ -453,6 +454,10 @@ void postprocess_cpu_params(
             cpuparams.n_threads = common_cpu_get_num_math();
         }
     }
+
+    // If this role inherited its thread count, preserve whether the source role was
+    // automatic. In particular, an explicit -t must remain the inherited -tb value.
+    const bool threads_were_auto = cpuparams.n_threads_auto;
 
     // A role inherits its model's affinity unless that role has its own mask or policy.
     // Preserve explicit role settings when the legacy whole-struct inheritance above runs.

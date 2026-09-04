@@ -75,6 +75,7 @@ enum common_cpu_core_policy {
 
 struct common_cpu_params {
     int      n_threads                   = -1;
+    bool     n_threads_auto              = false;   // Resolved from an automatic/default thread count.
     bool     cpumask[GGML_MAX_N_THREADS] = {false}; // CPU affinity mask.
     bool     mask_valid                  = false;   // Default: any CPU
     bool     mask_explicit               = false;   // Set by a role-specific CLI mask/range.

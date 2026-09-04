@@ -250,6 +250,16 @@ static void test(void) {
 
     {
         common_params cpu_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--threads", "4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
+        assert(cpu_params.cpuparams.n_threads == 4);
+        assert(cpu_params.cpuparams_batch.n_threads == 4);
+        assert(!cpu_params.cpuparams.n_threads_auto);
+        assert(!cpu_params.cpuparams_batch.n_threads_auto);
+    }
+
+    {
+        common_params cpu_params;
         argv = {"binary_name", "-m", "model_file.gguf", "--cpu-core-policy", "efficiency", "--cpu-mask", "3", "--threads-batch", "4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
         assert(cpu_params.cpuparams.core_policy == COMMON_CPU_CORE_POLICY_EFFICIENCY);
