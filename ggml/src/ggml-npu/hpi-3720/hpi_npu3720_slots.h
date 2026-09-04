@@ -35,7 +35,8 @@ static inline hpi3720_exec_slot *hpi3720_slot_acquire(hpi3720_program *program) 
 }
 
 static inline int hpi3720_slot_record(hpi3720_program *program, hpi3720_exec_slot *slot,
-                                     void *weights, ze_command_queue_handle_t queue) {
+                                     void *weights, ze_command_queue_handle_t queue,
+                                     double *init_ms) {
     npu_graph *g = &program->graph;
     if (slot->state != HPI3720_PREPARED) return -1;
     if (slot->list && slot->bound_weights == weights && program->initialized) return 0;
@@ -46,11 +47,13 @@ static inline int hpi3720_slot_record(hpi3720_program *program, hpi3720_exec_slo
     if (npu_graph_set_arg(g, 0, slot->x) || npu_graph_set_arg(g, 1, weights) ||
         npu_graph_set_arg(g, 2, slot->y)) return -1;
     if (!program->initialized) {
+        const double start = init_ms ? npu_now_ms() : 0.0;
         if (npu_list_create(g->d, &program->init_list)) return -1;
         if (npu_list_graph_init(g, program->init_list)) return -1;
         if (npu_queue_run(g->d, queue, program->init_list, UINT64_MAX)) return -1;
         if (npu_list_destroy(g->d, &program->init_list)) return -1;
         program->initialized = 1;
+        if (init_ms) *init_ms += npu_now_ms() - start;
     }
     if (npu_list_create(g->d, &slot->list) || npu_list_graph_exec(g, slot->list)) return -1;
     slot->bound_weights = weights;

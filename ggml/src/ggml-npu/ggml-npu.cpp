@@ -261,7 +261,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         const double output = after.output_ms - before.output_ms;
         const double fallback = after.fallback_ms - before.fallback_ms;
         // A scheduler graph view can cover part of a token. Normalize at the benchmark boundary.
-        fprintf(stderr, "NPU_PROFILE graph=%llu nodes=%d wall_ms=%.6f cpu_ms=%.6f prepare_ms=%.6f input_ms=%.6f submit_ms=%.6f sync_ms=%.6f output_ms=%.6f fallback_ms=%.6f other_ms=%.6f cpu_batches=%llu submissions=%llu graphs=%llu fallback_ops=%llu cache_misses=%llu\n",
+        fprintf(stderr, "NPU_PROFILE graph=%llu nodes=%d wall_ms=%.6f cpu_ms=%.6f prepare_ms=%.6f input_ms=%.6f submit_ms=%.6f sync_ms=%.6f output_ms=%.6f fallback_ms=%.6f other_ms=%.6f cpu_batches=%llu submissions=%llu graphs=%llu fallback_ops=%llu cache_misses=%llu lookup_ms=%.6f build_ms=%.6f init_ms=%.6f record_ms=%.6f warm_hits=%llu negative_hits=%llu shape_builds=%llu command_records=%llu list_reuses=%llu\n",
                 (unsigned long long)++ctx->profile_graphs, cgraph->n_nodes,
                 wall_ms, cpu_ms, prepare, input, submit, sync, output, fallback,
                 wall_ms - cpu_ms - prepare - input - submit - sync - output - fallback,
@@ -269,7 +269,14 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 (unsigned long long)(after.submissions - before.submissions),
                 (unsigned long long)(after.graphs - before.graphs),
                 (unsigned long long)(after.fallback_ops - before.fallback_ops),
-                (unsigned long long)(after.cache_misses - before.cache_misses));
+                (unsigned long long)(after.cache_misses - before.cache_misses),
+                after.lookup_ms - before.lookup_ms, after.build_ms - before.build_ms,
+                after.init_ms - before.init_ms, after.record_ms - before.record_ms,
+                (unsigned long long)(after.warm_hits - before.warm_hits),
+                (unsigned long long)(after.negative_hits - before.negative_hits),
+                (unsigned long long)(after.shape_builds - before.shape_builds),
+                (unsigned long long)(after.command_records - before.command_records),
+                (unsigned long long)(after.list_reuses - before.list_reuses));
     };
 
     if (!ctx->cpu) {

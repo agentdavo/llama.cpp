@@ -334,8 +334,10 @@ static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
 static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_status *st) {
     *st = HPI_OK;
     double t0 = p->profile ? npu_now_ms() : 0.0;
+    int lookup_charged = 0;
     if (p->failed) { *st = HPI_EDEVICE; return NULL; }
     npu3720_shape *s = shape_find(p, op);
+    if (s && p->profile) p->profile->warm_hits++;
     if (!s) {
         if (p->profile) p->profile->cache_misses++;
         /* Fixed weights/cache for this device lifetime. Avoid rehashing an entire
@@ -348,16 +350,29 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
             missing = m->w_key == op->w && m->capacity == capacity && m->N == op->N && m->K == op->K;
         }
         if (missing) {
+            if (p->profile) p->profile->negative_hits++;
             *st = HPI_UNAVAILABLE;
         } else {
+            if (p->profile) {
+                p->profile->lookup_ms += npu_now_ms() - t0;
+                p->profile->shape_builds++;
+                lookup_charged = 1;
+            }
+            const double build_start = p->profile ? npu_now_ms() : 0.0;
             s = shape_build(p, op, st);
+            if (p->profile) p->profile->build_ms += npu_now_ms() - build_start;
             if (!s && *st == HPI_UNAVAILABLE) {
                 npu3720_miss *m = &p->misses[p->nmisses++];
                 m->w_key = op->w; m->capacity = capacity; m->N = op->N; m->K = op->K;
             }
         }
     }
-    if (p->profile) p->profile->prepare_ms += npu_now_ms() - t0;
+    if (p->profile) {
+        const double elapsed = npu_now_ms() - t0;
+        p->profile->prepare_ms += elapsed;
+        /* A cold attempt charged lookup before shape_build above. */
+        if (!lookup_charged) p->profile->lookup_ms += elapsed;
+    }
     if (!s) return NULL;
 
     if (s->program) {
@@ -382,13 +397,24 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     }
     if (s->program) {
         t0 = p->profile ? npu_now_ms() : 0.0;
-        if (hpi3720_slot_record(s->program, s->program_slot, s->weight_mem, p->q)) {
+        const int reuse = s->program_slot->list && s->program_slot->bound_weights == s->weight_mem && s->program->initialized;
+        double init_elapsed = 0.0;
+        const int record_status = hpi3720_slot_record(s->program, s->program_slot, s->weight_mem, p->q,
+                                                    p->profile ? &init_elapsed : NULL);
+        if (p->profile) {
+            const double elapsed = npu_now_ms() - t0;
+            p->profile->prepare_ms += elapsed;
+            p->profile->init_ms += init_elapsed;
+            p->profile->record_ms += elapsed - init_elapsed;
+            if (reuse) p->profile->list_reuses++;
+            else if (!record_status) p->profile->command_records++;
+        }
+        if (record_status) {
             s->program_slot->state = HPI3720_IDLE; s->program_slot = NULL;
             p->failed = 1;
             *st = HPI_EDEVICE; return NULL;
         }
         s->exec_list = s->program_slot->list;
-        if (p->profile) p->profile->prepare_ms += npu_now_ms() - t0;
         return s;
     }
 
@@ -399,6 +425,12 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
             npu_queue_run(&p->d, p->q, s->init_list, UINT64_MAX) ||
             npu_list_destroy(&p->d, &s->init_list)) { p->failed = 1; *st = HPI_EDEVICE; return NULL; }
         s->initialized = 1;
+        if (p->profile) {
+            const double now = npu_now_ms();
+            p->profile->init_ms += now - t0;
+            p->profile->prepare_ms += now - t0;
+            t0 = now;
+        }
     }
     /* Build the AppendGraphExecute list once (binds this shape's fixed x_mem/y_mem, closed = re-runnable). */
     if (!s->exec_ready) {
@@ -406,8 +438,15 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
             p->failed = 1; *st = HPI_EDEVICE; return NULL;
         }
         s->exec_ready = 1;
+        if (p->profile) p->profile->command_records++;
+    } else {
+        if (p->profile) p->profile->list_reuses++;
     }
-    if (p->profile) p->profile->prepare_ms += npu_now_ms() - t0;
+    if (p->profile) {
+        const double elapsed = npu_now_ms() - t0;
+        p->profile->prepare_ms += elapsed;
+        p->profile->record_ms += elapsed;
+    }
     return s;
 }
 

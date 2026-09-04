@@ -56,6 +56,11 @@ typedef struct {
     int enabled;
     double prepare_ms, input_ms, submit_ms, sync_ms, output_ms, fallback_ms;
     uint64_t submissions, graphs, fallback_ops, cache_misses;
+    /* Components of prepare_ms, not additional wall time. init_ms includes
+     * the one-time graph initialize submission/wait; sync_ms is execute wait.
+     * No API wall counter is a DMA/SHAVE/DPU execution measurement. */
+    double lookup_ms, build_ms, init_ms, record_ms;
+    uint64_t warm_hits, negative_hits, shape_builds, command_records, list_reuses;
 } hpi_profile;
 
 hpi_status hpi_get_profile(const hpi_device *dev, hpi_profile *out);
