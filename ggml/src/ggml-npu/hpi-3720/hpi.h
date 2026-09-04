@@ -96,6 +96,9 @@ hpi_status  hpi_q8_0_gemm_run(hpi_device *dev, const hpi_q8_0_gemm *op);
  * falls back to running them one at a time if the backend has no batch path. */
 hpi_status  hpi_q8_0_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n);
 
+/* Execute available hardware ops; per-op HPI_UNAVAILABLE leaves y untouched for caller fallback. */
+hpi_status  hpi_q8_0_gemm_batch_try(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results);
+
 /* Release a device. Safe on NULL. */
 void        hpi_close(hpi_device *dev);
 

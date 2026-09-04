@@ -56,6 +56,11 @@ static int run_case(int64_t M, int64_t N, int64_t K) {
     if (!dev) { fprintf(stderr, "hpi_open: %s\n", hpi_status_str(st)); return 1; }
 
     const hpi_q8_0_gemm op = { .M = M, .N = N, .K = K, .w = w, .x = x, .y = y };
+    for (int64_t i = 0; i < M * N; i++) y[i] = 123.0f;
+    hpi_status result = HPI_OK;
+    st = hpi_q8_0_gemm_batch_try(dev, &op, 1, &result);
+    if (st != HPI_OK || result != HPI_UNAVAILABLE) return 1;
+    for (int64_t i = 0; i < M * N; i++) if (y[i] != 123.0f) return 1;
     st = hpi_q8_0_gemm_run(dev, &op);
     if (st != HPI_OK) { fprintf(stderr, "gemm: %s\n", hpi_status_str(st)); hpi_close(dev); return 1; }
 

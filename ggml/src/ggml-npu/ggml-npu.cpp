@@ -358,9 +358,16 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                         n_dpu, (long long) dpu_ops[0].M, (long long) dpu_ops[0].N, (long long) dpu_ops[0].K);
                 fflush(stderr);
             }
-            GGML_ASSERT(hpi_q8_0_gemm_batch(ctx->hpi, dpu_ops, n_dpu) == HPI_OK);
+            hpi_status results[DPU_BATCH];
+            GGML_ASSERT(hpi_q8_0_gemm_batch_try(ctx->hpi, dpu_ops, n_dpu, results) == HPI_OK);
             if (getenv("GGML_NPU_TRACE_NODES")) { fprintf(stderr, "hpi-3720:   << flush_dpu ok\n"); fflush(stderr); }
             for (int j = 0; j < n_dpu; j++) {
+                if (results[j] == HPI_UNAVAILABLE) {
+                    if (batch->n_nodes >= batch_cap) flush_cpu();
+                    batch->nodes[batch->n_nodes++] = dpu_dst[j];
+                    continue;
+                }
+                GGML_ASSERT(results[j] == HPI_OK);
                 const hpi_q8_0_gemm & o = dpu_ops[j];
                 ctx->n_mul_mat++;
                 ctx->n_flop += 2ull * (uint64_t) o.M * (uint64_t) o.N * (uint64_t) o.K;
@@ -412,7 +419,10 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
             for (int k = 0; k < n_dpu; k++) {
                 if (node->src[0] == dpu_dst[k] || node->src[1] == dpu_dst[k]) { dep = true; break; }
             }
-            if (dep || n_dpu == DPU_BATCH) flush_dpu();
+            if (dep || n_dpu == DPU_BATCH) {
+                flush_dpu();
+                flush_cpu(); // A dependency can have fallen back to the CPU batch.
+            }
             dpu_ops[n_dpu] = hpi_q8_0_gemm{
                 node->ne[1], node->src[0]->ne[1], node->src[0]->ne[0],
                 (const hpi_block_q8_0 *) node->src[0]->data,
@@ -424,6 +434,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         } else {
             flush_dpu();   // this node may read a batched DPU output -> execute the batch first
             if (ggml_backend_npu_dpu_cacheable(node)) {
+                flush_cpu();
                 ggml_backend_npu_mul_mat(ctx, node);   // cacheable but ne12/ne13>1 (multi-GEMM) -> run individually
             } else if (ggml_backend_npu_mmid_cacheable(node)) {
                 flush_cpu();                           // experts read CPU-computed activations -> flush first

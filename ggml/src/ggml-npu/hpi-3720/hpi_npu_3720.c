@@ -173,7 +173,7 @@ static hpi_status npu_open(hpi_device *dev) {
         return HPI_EDEVICE;
     }
 
-    /* One synchronous, non-turbo queue for the device's lifetime. Non-turbo on purpose: the turbo
+    /* One non-turbo queue, with a host wait after each batch. Non-turbo on purpose: the turbo
      * clock + a metric streamer once hard-froze the machine (src/npu.h HAZARD); leave turbo to an
      * explicit, coordinated benchmark, not the default compute path. */
     if (npu_queue_create(&p->d, 0, 0, &p->q) != 0) { free(p); return HPI_EDEVICE; }
@@ -420,7 +420,7 @@ static hpi_status npu_cpu_fallback(hpi_device *dev, const hpi_q8_0_gemm *op) {
     return st;
 }
 
-/* The queue is synchronous: submit_ms can include device execution. */
+/* API wall times include driver overhead; sync_ms is not an isolated device compute timer. */
 static hpi_status npu_submit(npu3720_priv *p, ze_command_list_handle_t *lists, uint32_t n) {
     double t0 = p->profile ? npu_now_ms() : 0.0;
     ze_result_t result = p->z.zeCommandQueueExecuteCommandLists(p->q, n, lists, NULL);
@@ -458,16 +458,24 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
  * zeCommandQueueExecuteCommandLists + ONE zeCommandQueueSynchronize (amortizes the per-op submit+sync
  * that dominates small ops), then read all outputs. Uncached ops fall to the CPU reference in place. */
 #define NPU_GEMM_BATCH_MAX 32
-static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n) {
+static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results) {
     if (!dev || !dev->priv || !ops || n <= 0) return HPI_EINVAL;
     npu3720_priv *p = (npu3720_priv *)dev->priv;
     if (n > NPU_GEMM_BATCH_MAX) {                                   /* split oversized batches */
         for (int off = 0; off < n; off += NPU_GEMM_BATCH_MAX) {
             int m = (n - off < NPU_GEMM_BATCH_MAX) ? (n - off) : NPU_GEMM_BATCH_MAX;
-            hpi_status st = npu_gemm_batch(dev, ops + off, m);
+            hpi_status st = npu_gemm_batch_impl(dev, ops + off, m, results ? results + off : NULL);
             if (st != HPI_OK) return st;
         }
         return HPI_OK;
+    }
+    /* A resident shape owns one input/output slot. Submit before staging that slot again. */
+    for (int i = 1; i < n; i++) for (int j = 0; j < i; j++) {
+        if (ops[i].w == ops[j].w && ops[i].M == ops[j].M && ops[i].N == ops[j].N && ops[i].K == ops[j].K) {
+            hpi_status st = npu_gemm_batch_impl(dev, ops, i, results);
+            if (st != HPI_OK) return st;
+            return npu_gemm_batch_impl(dev, ops + i, n - i, results ? results + i : NULL);
+        }
     }
     npu3720_shape *sh[NPU_GEMM_BATCH_MAX];
     ze_command_list_handle_t lists[NPU_GEMM_BATCH_MAX];
@@ -477,6 +485,7 @@ static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int 
         sh[i] = npu_prepare(p, &ops[i], &st);
         if (!sh[i]) {
             if (st == HPI_UNAVAILABLE) {
+                if (results) { results[i] = HPI_UNAVAILABLE; continue; }
                 st = npu_cpu_fallback(dev, &ops[i]);
                 if (st != HPI_OK) return st;
                 continue;
@@ -492,8 +501,17 @@ static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int 
     for (int i = 0; i < n; i++) if (sh[i]) {
         const hpi_status st = npu_finish(p, sh[i], &ops[i]);
         if (st != HPI_OK) return st;
+        if (results) results[i] = HPI_OK;
     }
     return HPI_OK;
+}
+
+static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n) {
+    return npu_gemm_batch_impl(dev, ops, n, NULL);
+}
+
+static hpi_status npu_gemm_batch_try(hpi_device *dev, const hpi_q8_0_gemm *ops, int n, hpi_status *results) {
+    return npu_gemm_batch_impl(dev, ops, n, results);
 }
 
 static const hpi_backend_ops g_npu_ops = {
@@ -505,6 +523,7 @@ static const hpi_backend_ops g_npu_ops = {
     .gemm = npu_gemm,
     .gemm_batch = npu_gemm_batch,
     .close = npu_close,
+    .gemm_batch_try = npu_gemm_batch_try,
 };
 
 const hpi_backend_ops *hpi_backend_npu_3720(void) { return &g_npu_ops; }
