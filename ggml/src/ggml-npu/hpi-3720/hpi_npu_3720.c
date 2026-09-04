@@ -111,6 +111,9 @@ typedef struct {
     int                       q_ok;
     npu3720_shape             cache[NPU3720_CACHE_MAX];
     int                       ncache;
+    size_t                    blob_bytes_resident;  /* sum of blob_len over graphs the device accepted;
+                                                     * printed on a graph-create failure so the ceiling
+                                                     * can be read as COUNT- or MEMORY-bound. */
 } npu3720_priv;
 
 /* ---------------------------------------------------------------------------------------------- *
@@ -241,8 +244,25 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
      * CPU reference (HPI_UNAVAILABLE) rather than error out (HPI_EDEVICE would crash the caller's assert),
      * so exceeding the device graph budget just means the surplus ops run on CPU. */
     if (npu_graph_create(&p->d, tmp.blob, tmp.blob_len, &tmp.g) != 0) {
+        /* Report the CEILING, not just the failure. Whether the device budget binds on graph COUNT or
+         * on total graph MEMORY has never been settled, and it decides how much weights-as-input (A2)
+         * actually buys: a count limit means A2's ~10-graphs-per-shape is a ~30x headroom win, a memory
+         * limit means A2 wins only to the extent it stops baking weights into the graph. Both numbers
+         * at the moment of failure are exactly the discriminator, so print them. npu.h's NPU__ZE has
+         * already printed the raw ze_result ("[FAIL] ... pfnCreate -> 0x%x"): 0x70000003 =
+         * OUT_OF_DEVICE_MEMORY, 0x70000002 = OUT_OF_HOST_MEMORY, anything else points at a count/handle
+         * limit rather than memory. */
+        fprintf(stderr, "hpi-3720: graph create FAILED at graph #%zu, %.1f MiB of blobs already resident "
+                        "(this blob %.1f MiB, N=%lld K=%lld M=%lld) -- see the ze_result above: "
+                        "0x70000003=OUT_OF_DEVICE_MEMORY / 0x70000002=OUT_OF_HOST_MEMORY => MEMORY-bound; "
+                        "any other code => COUNT-bound\n",
+                (size_t)(p->ncache + 1), (double)p->blob_bytes_resident / (1024.0 * 1024.0),
+                (double)tmp.blob_len / (1024.0 * 1024.0),
+                (long long)op->N, (long long)op->K, (long long)op->M);
+        fflush(stderr);
         free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL;
     }
+    p->blob_bytes_resident += tmp.blob_len;
 
     /* Validate the seam's arg indices against what the graph actually reports. */
     if (tmp.io.arg_x < 0 || tmp.io.arg_y < 0 ||
