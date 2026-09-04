@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "qwen4exp-hc.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -369,6 +370,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+    const char * fusion = std::getenv("LLAMA_QWEN4EXP_HC_FUSION");
+    if (fusion && std::strcmp(fusion, "1") == 0) {
+        if (ggml_tensor * cur = qwen4exp_hc_write_fused(ctx0, residual, b, w)) {
+            cb(cur, "hc_combine", il);
+            return cur;
+        }
+    }
     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
 
     ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
