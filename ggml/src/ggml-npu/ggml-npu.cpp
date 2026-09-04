@@ -395,11 +395,20 @@ bool ggml_backend_is_npu(ggml_backend_t backend) {
 
 // --- device interface --------------------------------------------------------------------------- //
 
-// GPU-class whole-layer offload (NPU_OFFLOAD_GPU=1) vs the default ACCEL op-fallback. GPU-type makes
-// -ngl place whole layers (full-M mul_mats) on the NPU — VERIFIED routing — but llama then also
-// pre-allocates the layer's KV cache on our device buft and expects us to run its ops (SET_ROWS, ...),
-// which we do not yet (that needs full layer-op coverage / CPU-passthrough). So it is OPT-IN and still
-// WIP; default stays ACCEL (correct: opportunistic Q8_0 mul_mat offload, everything else on CPU).
+// GPU-class whole-layer offload (NPU_OFFLOAD_GPU=1) vs the ACCEL op-fallback. GPU-type makes -ngl
+// place whole layers (full-M mul_mats) on the NPU — VERIFIED routing. The old blocker here (llama
+// pre-allocating the layer's KV cache on our device buft and expecting us to run SET_ROWS et al) is
+// SOLVED: get_host_buffer_type below hands the KV cache back to the CPU, and graph_compute delegates
+// every non-DPU node to the internal CPU backend — the ggml-hexagon two-buft split.
+//
+// GPU-passthrough is THE DIRECTION, not an experiment: every silicon measurement in re/FINDINGS.md
+// (incl. the batched/unbatched A/B at :1635) was taken with NPU_OFFLOAD_GPU=1. The env var default
+// stays 0 only so an unset run cannot surprise anyone with the no-mmap cost below — do NOT read that
+// default as ACCEL being the plan.
+//
+// COST, and it is sharp: the device buft is is_host=false ON PURPOSE (that is what makes the sched
+// route ops to us), so llama does NOT mmap weights placed here — it commits them to RAM. On a large
+// model -ngl 999 without -ncmoe will try to commit the whole file. See scripts/run.sh.
 static bool ggml_backend_npu_gpu_offload(void) {
     static int v = -1;
     if (v < 0) { const char * e = getenv("NPU_OFFLOAD_GPU"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
