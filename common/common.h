@@ -65,10 +65,20 @@ struct common_control_vector_load_info;
 // CPU utils
 //
 
+enum common_cpu_core_policy {
+    COMMON_CPU_CORE_POLICY_INHERIT = -1,
+    COMMON_CPU_CORE_POLICY_AUTO,
+    COMMON_CPU_CORE_POLICY_ALL,
+    COMMON_CPU_CORE_POLICY_PERFORMANCE,
+    COMMON_CPU_CORE_POLICY_EFFICIENCY,
+};
+
 struct common_cpu_params {
     int      n_threads                   = -1;
     bool     cpumask[GGML_MAX_N_THREADS] = {false}; // CPU affinity mask.
     bool     mask_valid                  = false;   // Default: any CPU
+    bool     mask_explicit               = false;   // Set by a role-specific CLI mask/range.
+    enum common_cpu_core_policy core_policy = COMMON_CPU_CORE_POLICY_INHERIT; // Hybrid CPU selection policy.
     enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
     bool     strict_cpu                  = false;   // Use strict CPU placement
     uint32_t poll                        = 50;      // Polling (busywait) level (0 - no polling, 100 - mostly polling)
@@ -76,6 +86,7 @@ struct common_cpu_params {
 
 int32_t common_cpu_get_num_physical_cores();
 int32_t common_cpu_get_num_math();
+const char * common_cpu_core_policy_name(enum common_cpu_core_policy policy);
 
 //
 // Common params
@@ -767,7 +778,11 @@ std::string common_params_get_system_info(const common_params & params);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);
-void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model = nullptr);
+void postprocess_cpu_params(
+        common_cpu_params & cpuparams,
+        const common_cpu_params * role_model = nullptr,
+        const char * role_name = "CPU workload",
+        bool throughput_role = false);
 bool set_process_priority(enum ggml_sched_priority prio);
 
 //

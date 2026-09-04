@@ -888,11 +888,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
-    postprocess_cpu_params(params.cpuparams,       nullptr);
-    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+    postprocess_cpu_params(params.cpuparams,       nullptr,           "generation",       false);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams, "batch/prompt",     true);
 
-    postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
-    postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+    postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams,       "draft generation",   false);
+    postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch, "draft batch/prompt", true);
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1540,6 +1540,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "CPU affinity mask: arbitrarily long hex. Complements cpu-range (default: \"\")",
         [](common_params & params, const std::string & mask) {
             params.cpuparams.mask_valid = true;
+            params.cpuparams.mask_explicit = true;
             if (!parse_cpu_mask(mask, params.cpuparams.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }
@@ -1550,11 +1551,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "range of CPUs for affinity. Complements --cpu-mask",
         [](common_params & params, const std::string & range) {
             params.cpuparams.mask_valid = true;
+            params.cpuparams.mask_explicit = true;
             if (!parse_cpu_range(range, params.cpuparams.cpumask)) {
                 throw std::invalid_argument("invalid range");
             }
         }
     ));
+    add_opt(common_arg(
+        {"--cpu-core-policy"}, "auto|all|performance|efficiency",
+        "hybrid CPU core selection policy for generation (default: auto; explicit --cpu-mask/--cpu-range takes precedence)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.cpuparams.core_policy = COMMON_CPU_CORE_POLICY_AUTO;
+            } else if (value == "all") {
+                params.cpuparams.core_policy = COMMON_CPU_CORE_POLICY_ALL;
+            } else if (value == "performance") {
+                params.cpuparams.core_policy = COMMON_CPU_CORE_POLICY_PERFORMANCE;
+            } else if (value == "efficiency") {
+                params.cpuparams.core_policy = COMMON_CPU_CORE_POLICY_EFFICIENCY;
+            } else {
+                throw std::invalid_argument("invalid CPU core policy");
+            }
+        }
+    ).set_env("LLAMA_ARG_CPU_CORE_POLICY"));
     add_opt(common_arg(
         {"--cpu-strict"}, "<0|1>",
         string_format("use strict CPU placement (default: %u)\n", (unsigned) params.cpuparams.strict_cpu),
@@ -1584,6 +1603,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "CPU affinity mask: arbitrarily long hex. Complements cpu-range-batch (default: same as --cpu-mask)",
         [](common_params & params, const std::string & mask) {
             params.cpuparams_batch.mask_valid = true;
+            params.cpuparams_batch.mask_explicit = true;
             if (!parse_cpu_mask(mask, params.cpuparams_batch.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }
@@ -1594,8 +1614,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "ranges of CPUs for affinity. Complements --cpu-mask-batch",
         [](common_params & params, const std::string & range) {
             params.cpuparams_batch.mask_valid = true;
+            params.cpuparams_batch.mask_explicit = true;
             if (!parse_cpu_range(range, params.cpuparams_batch.cpumask)) {
                 throw std::invalid_argument("invalid range");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--cpu-core-policy-batch"}, "auto|all|performance|efficiency",
+        "hybrid CPU core selection policy for batch and prompt processing (default: auto uses all cores; an explicit generation policy is inherited; explicit batch mask/range takes precedence)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.cpuparams_batch.core_policy = COMMON_CPU_CORE_POLICY_AUTO;
+            } else if (value == "all") {
+                params.cpuparams_batch.core_policy = COMMON_CPU_CORE_POLICY_ALL;
+            } else if (value == "performance") {
+                params.cpuparams_batch.core_policy = COMMON_CPU_CORE_POLICY_PERFORMANCE;
+            } else if (value == "efficiency") {
+                params.cpuparams_batch.core_policy = COMMON_CPU_CORE_POLICY_EFFICIENCY;
+            } else {
+                throw std::invalid_argument("invalid CPU core policy");
             }
         }
     ));
@@ -4013,6 +4051,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask)",
         [](common_params & params, const std::string & mask) {
             params.speculative.draft.cpuparams.mask_valid = true;
+            params.speculative.draft.cpuparams.mask_explicit = true;
             if (!parse_cpu_mask(mask, params.speculative.draft.cpuparams.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }
@@ -4023,6 +4062,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Ranges of CPUs for affinity. Complements --cpu-mask-draft",
         [](common_params & params, const std::string & range) {
             params.speculative.draft.cpuparams.mask_valid = true;
+            params.speculative.draft.cpuparams.mask_explicit = true;
             if (!parse_cpu_range(range, params.speculative.draft.cpuparams.cpumask)) {
                 throw std::invalid_argument("invalid range");
             }
@@ -4057,6 +4097,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask)",
         [](common_params & params, const std::string & mask) {
             params.speculative.draft.cpuparams_batch.mask_valid = true;
+            params.speculative.draft.cpuparams_batch.mask_explicit = true;
             if (!parse_cpu_mask(mask, params.speculative.draft.cpuparams_batch.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }
@@ -4067,6 +4108,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Ranges of CPUs for affinity. Complements --cpu-mask-draft-batch)",
         [](common_params & params, const std::string & range) {
             params.speculative.draft.cpuparams_batch.mask_valid = true;
+            params.speculative.draft.cpuparams_batch.mask_explicit = true;
             if (!parse_cpu_range(range, params.speculative.draft.cpuparams_batch.cpumask)) {
                 throw std::invalid_argument("invalid cpumask");
             }

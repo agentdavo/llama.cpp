@@ -146,6 +146,152 @@ int32_t common_cpu_get_num_physical_cores() {
     return n_threads > 0 ? (n_threads <= 4 ? n_threads : n_threads / 2) : 4;
 }
 
+const char * common_cpu_core_policy_name(enum common_cpu_core_policy policy) {
+    switch (policy) {
+        case COMMON_CPU_CORE_POLICY_INHERIT:     return "inherit";
+        case COMMON_CPU_CORE_POLICY_AUTO:        return "auto";
+        case COMMON_CPU_CORE_POLICY_ALL:         return "all";
+        case COMMON_CPU_CORE_POLICY_PERFORMANCE: return "performance";
+        case COMMON_CPU_CORE_POLICY_EFFICIENCY:  return "efficiency";
+    }
+
+    return "unknown";
+}
+
+struct common_cpu_topology {
+    bool available = false;
+    bool hybrid    = false;
+    std::vector<int32_t> performance_cpus;
+    std::vector<int32_t> efficiency_cpus;
+};
+
+#if defined(_WIN32)
+
+static std::string cpu_ids_to_string(const std::vector<int32_t> & cpus) {
+    std::ostringstream result;
+    for (size_t i = 0; i < cpus.size(); ++i) {
+        if (i != 0) {
+            result << ',';
+        }
+        result << cpus[i];
+    }
+    return result.str();
+}
+
+static common_cpu_topology detect_windows_cpu_topology() {
+    common_cpu_topology result;
+
+    // Resolve dynamically so binaries continue to start on Windows versions that do not
+    // expose the CPU Sets API. The policy is deliberately fail-open in that case.
+    using get_system_cpu_set_information_fn = BOOL (WINAPI *) (
+            PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32 == nullptr) {
+        return result;
+    }
+
+    const FARPROC get_cpu_sets_address = GetProcAddress(kernel32, "GetSystemCpuSetInformation");
+    get_system_cpu_set_information_fn get_cpu_sets = nullptr;
+    static_assert(sizeof(get_cpu_sets) == sizeof(get_cpu_sets_address), "unexpected Windows function pointer size");
+    std::memcpy(&get_cpu_sets, &get_cpu_sets_address, sizeof(get_cpu_sets));
+    if (get_cpu_sets == nullptr) {
+        return result;
+    }
+
+    ULONG buffer_size = 0;
+    if (get_cpu_sets(nullptr, 0, &buffer_size, GetCurrentProcess(), 0) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || buffer_size == 0) {
+        return result;
+    }
+
+    std::vector<unsigned char> buffer(buffer_size);
+    if (!get_cpu_sets(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                      buffer_size, &buffer_size, GetCurrentProcess(), 0)) {
+        return result;
+    }
+
+    struct cpu_entry {
+        int32_t logical_index;
+        uint8_t efficiency_class;
+    };
+    std::vector<cpu_entry> entries;
+    uint8_t min_class = UINT8_MAX;
+    uint8_t max_class = 0;
+    bool unsupported_processor_group = false;
+
+    DWORD_PTR process_mask = 0;
+    DWORD_PTR system_mask  = 0;
+    const bool have_process_mask = GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0;
+
+    size_t offset = 0;
+    while (offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= buffer_size) {
+        const auto * info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION *>(buffer.data() + offset);
+        if (info->Size < sizeof(SYSTEM_CPU_SET_INFORMATION) || info->Size > buffer_size - offset) {
+            return common_cpu_topology{};
+        }
+
+        if (info->Type == CpuSetInformation && info->CpuSet.Group != 0) {
+            unsupported_processor_group = true;
+        } else if (info->Type == CpuSetInformation) {
+            const int32_t cpu = static_cast<int32_t>(info->CpuSet.LogicalProcessorIndex);
+            const bool representable = cpu >= 0 && cpu < 64 && cpu < GGML_MAX_N_THREADS;
+            const bool process_allows = !have_process_mask || (process_mask & (static_cast<DWORD_PTR>(1) << cpu)) != 0;
+            const bool allocated_elsewhere = info->CpuSet.Allocated && !info->CpuSet.AllocatedToTargetProcess;
+            if (representable && process_allows && !allocated_elsewhere) {
+                const uint8_t cpu_class = info->CpuSet.EfficiencyClass;
+                entries.push_back({cpu, cpu_class});
+                min_class = std::min(min_class, cpu_class);
+                max_class = std::max(max_class, cpu_class);
+            }
+        }
+
+        offset += info->Size;
+    }
+
+    // ggml's Windows affinity path currently represents only processor group zero.
+    // Do not silently select a partial machine when additional groups are present.
+    if (entries.empty() || unsupported_processor_group) {
+        return result;
+    }
+
+    result.available = true;
+    result.hybrid = min_class != max_class;
+    if (!result.hybrid) {
+        return result;
+    }
+
+    for (const cpu_entry & entry : entries) {
+        if (entry.efficiency_class == max_class) {
+            result.performance_cpus.push_back(entry.logical_index);
+        } else {
+            result.efficiency_cpus.push_back(entry.logical_index);
+        }
+    }
+
+    if (result.performance_cpus.empty() || result.efficiency_cpus.empty()) {
+        return common_cpu_topology{};
+    }
+
+    COM_INF("hybrid CPU topology: performance CPUs [%s], efficiency CPUs [%s]\n",
+            cpu_ids_to_string(result.performance_cpus).c_str(),
+            cpu_ids_to_string(result.efficiency_cpus).c_str());
+    return result;
+}
+
+#endif // _WIN32
+
+static const common_cpu_topology & get_common_cpu_topology() {
+    static const common_cpu_topology topology = [] {
+#if defined(_WIN32)
+        return detect_windows_cpu_topology();
+#else
+        return common_cpu_topology{};
+#endif
+    }();
+    return topology;
+}
+
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
 #include <pthread.h>
 
@@ -285,16 +431,100 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 //
 
 
-void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model) {
+void postprocess_cpu_params(
+        common_cpu_params & cpuparams,
+        const common_cpu_params * role_model,
+        const char * role_name,
+        bool throughput_role) {
+    const bool threads_were_auto = cpuparams.n_threads < 0;
+    const bool mask_was_explicit = cpuparams.mask_explicit;
+    const enum common_cpu_core_policy requested_policy = cpuparams.core_policy;
+    bool explicit_mask[GGML_MAX_N_THREADS];
+    if (mask_was_explicit) {
+        std::memcpy(explicit_mask, cpuparams.cpumask, sizeof(explicit_mask));
+    }
+
     int32_t n_set = 0;
 
     if (cpuparams.n_threads < 0) {
-        // Assuming everything about cpuparams is invalid
         if (role_model != nullptr) {
             cpuparams = *role_model;
         } else {
             cpuparams.n_threads = common_cpu_get_num_math();
         }
+    }
+
+    // A role inherits its model's affinity unless that role has its own mask or policy.
+    // Preserve explicit role settings when the legacy whole-struct inheritance above runs.
+    if (mask_was_explicit) {
+        std::memcpy(cpuparams.cpumask, explicit_mask, sizeof(explicit_mask));
+        cpuparams.mask_valid = true;
+        cpuparams.mask_explicit = true;
+    } else if (role_model != nullptr && requested_policy == COMMON_CPU_CORE_POLICY_INHERIT) {
+        std::memcpy(cpuparams.cpumask, role_model->cpumask, sizeof(cpuparams.cpumask));
+        cpuparams.mask_valid = role_model->mask_valid;
+        cpuparams.mask_explicit = role_model->mask_explicit;
+    }
+
+    if (requested_policy == COMMON_CPU_CORE_POLICY_INHERIT) {
+        cpuparams.core_policy = role_model != nullptr ? role_model->core_policy : COMMON_CPU_CORE_POLICY_AUTO;
+    } else {
+        cpuparams.core_policy = requested_policy;
+        if (!mask_was_explicit) {
+            std::fill(std::begin(cpuparams.cpumask), std::end(cpuparams.cpumask), false);
+            cpuparams.mask_valid = false;
+            cpuparams.mask_explicit = false;
+        }
+    }
+
+    // A user-provided mask is always authoritative. Otherwise, auto selects the
+    // performance class on a hybrid CPU; unsupported and homogeneous systems retain
+    // the operating system's default placement.
+    const bool effective_explicit_mask = cpuparams.mask_explicit;
+    if (!effective_explicit_mask && cpuparams.core_policy != COMMON_CPU_CORE_POLICY_ALL) {
+        const common_cpu_topology & topology = get_common_cpu_topology();
+        if (topology.available && topology.hybrid) {
+            const std::vector<int32_t> * selected = nullptr;
+            if (cpuparams.core_policy == COMMON_CPU_CORE_POLICY_AUTO && throughput_role) {
+                // Prompt processing scales across all cores on the target Arrow Lake host.
+                // Leave the mask empty so Windows can schedule across both classes.
+                std::fill(std::begin(cpuparams.cpumask), std::end(cpuparams.cpumask), false);
+                cpuparams.mask_valid = false;
+                cpuparams.mask_explicit = false;
+                if (threads_were_auto) {
+                    cpuparams.n_threads = static_cast<int32_t>(
+                            topology.performance_cpus.size() + topology.efficiency_cpus.size());
+                }
+                COM_INF("hybrid CPU policy for %s: auto selected all CPUs for throughput%s\n",
+                        role_name, threads_were_auto ? " (automatic thread count uses both classes)" : "");
+            } else if (cpuparams.core_policy == COMMON_CPU_CORE_POLICY_AUTO ||
+                       cpuparams.core_policy == COMMON_CPU_CORE_POLICY_PERFORMANCE) {
+                selected = &topology.performance_cpus;
+            } else if (cpuparams.core_policy == COMMON_CPU_CORE_POLICY_EFFICIENCY) {
+                selected = &topology.efficiency_cpus;
+            }
+
+            if (selected != nullptr && !selected->empty()) {
+                std::fill(std::begin(cpuparams.cpumask), std::end(cpuparams.cpumask), false);
+                for (const int32_t cpu : *selected) {
+                    cpuparams.cpumask[cpu] = true;
+                }
+                cpuparams.mask_valid = true;
+                cpuparams.mask_explicit = false;
+                if (threads_were_auto && cpuparams.n_threads > static_cast<int32_t>(selected->size())) {
+                    cpuparams.n_threads = static_cast<int32_t>(selected->size());
+                }
+                COM_INF("hybrid CPU policy for %s: %s selected %zu CPUs%s\n",
+                        role_name, common_cpu_core_policy_name(cpuparams.core_policy), selected->size(),
+                        threads_were_auto ? " (automatic thread count capped to selection)" : "");
+            }
+        } else if (requested_policy == COMMON_CPU_CORE_POLICY_PERFORMANCE ||
+                   requested_policy == COMMON_CPU_CORE_POLICY_EFFICIENCY) {
+            COM_WRN("hybrid CPU policy for %s: topology unavailable or homogeneous; using OS placement\n", role_name);
+        }
+    } else if (effective_explicit_mask && requested_policy != COMMON_CPU_CORE_POLICY_INHERIT &&
+               requested_policy != COMMON_CPU_CORE_POLICY_ALL) {
+        COM_INF("hybrid CPU policy for %s: explicit CPU mask takes precedence\n", role_name);
     }
 
     for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {

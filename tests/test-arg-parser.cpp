@@ -239,6 +239,35 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.cpuparams.n_threads == 1234);
 
+    {
+        common_params cpu_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--cpu-core-policy", "performance", "--cpu-core-policy-batch", "all"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
+        assert(cpu_params.cpuparams.core_policy == COMMON_CPU_CORE_POLICY_PERFORMANCE);
+        assert(cpu_params.cpuparams_batch.core_policy == COMMON_CPU_CORE_POLICY_ALL);
+        assert(!cpu_params.cpuparams_batch.mask_valid);
+    }
+
+    {
+        common_params cpu_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--cpu-core-policy", "efficiency", "--cpu-mask", "3", "--threads-batch", "4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
+        assert(cpu_params.cpuparams.core_policy == COMMON_CPU_CORE_POLICY_EFFICIENCY);
+        assert(cpu_params.cpuparams.mask_valid);
+        assert(cpu_params.cpuparams.cpumask[0]);
+        assert(cpu_params.cpuparams.cpumask[1]);
+        assert(cpu_params.cpuparams_batch.mask_valid);
+        assert(cpu_params.cpuparams_batch.cpumask[0]);
+        assert(cpu_params.cpuparams_batch.cpumask[1]);
+        assert(!cpu_params.cpuparams_batch.cpumask[2]);
+    }
+
+    {
+        common_params cpu_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--cpu-core-policy", "invalid"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     argv = {"binary_name", "--verbose"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.verbosity > 1);
