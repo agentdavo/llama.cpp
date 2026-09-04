@@ -72,6 +72,26 @@ static bool ggml_backend_npu_mmid_cacheable(const struct ggml_tensor * op) {
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1];
     if (N % 256 != 0 || K % 32 != 0) return false;
+
+    // MEASURED 2026-09-04 (unsloth Qwen3.8-Flash-Next): claiming these is a NET LOSS today, so it is
+    // opt-in. build_blob_cache.py authors blobs for 2D tensors ONLY (it skips len(ne)!=2), so a 3D
+    // expert stack NEVER has a blob. Claiming the op therefore routes it to the hpi scalar CPU
+    // reference, which is far slower than ggml-cpu -- we take work away from the fast path and do it
+    // slowly. Confirmed on the box: every logged blob MISS in the first NPU perplexity attempt was an
+    // expert slice of blk.2.ffn_down_exps (8/8 of the logged w0 values matched expert slices), M=1
+    // N=2560 K=640, all falling back to the scalar reference.
+    //
+    // Note -ncmoe does NOT protect against this: supports_buft accepts any host buft, so experts kept
+    // on the CPU by --n-cpu-moe are still schedulable to us. The gate has to be here.
+    //
+    // Set GGML_NPU_MMID=1 to re-enable once per-expert blobs exist (a real design question: 512
+    // experts x N layers is far too many baked graphs -- this wants weights-as-input / A2, not a blob
+    // per expert).
+    {
+        static int mmid = -1;
+        if (mmid < 0) { const char * e = getenv("GGML_NPU_MMID"); mmid = (e && e[0] && e[0] != '0') ? 1 : 0; }
+        if (!mmid) return false;
+    }
     return true;                                     // per-expert rows are M=1 (decode blob, any K)
 }
 
@@ -264,8 +284,26 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         }
     };
 
+    // GGML_NPU_TRACE_NODES=1 prints every node BEFORE it is classified or executed, flushed, so a crash
+    // inside the delegated CPU batch names the last node reached. GPU-passthrough hands us ops this path
+    // has never seen on models beyond the plain transformer it was developed against (Flash-Next brings
+    // SSM_SCAN/SSM_CONV, hyper-connections, the PLE gather), and a segfault with no output is otherwise
+    // extremely expensive to localise.
+    static int trace_nodes = -1;
+    if (trace_nodes < 0) {
+        const char * e = getenv("GGML_NPU_TRACE_NODES");
+        trace_nodes = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+        if (trace_nodes) {
+            fprintf(stderr, "hpi-3720: node[%d/%d] %-16s %-28s ne=[%lld,%lld,%lld,%lld]\n",
+                    i, cgraph->n_nodes, ggml_op_desc(node), node->name,
+                    (long long) node->ne[0], (long long) node->ne[1],
+                    (long long) node->ne[2], (long long) node->ne[3]);
+            fflush(stderr);
+        }
         if (node->op == GGML_OP_NONE) continue;
 
         const bool batchable = ggml_backend_npu_dpu_cacheable(node) && node->ne[2] == 1 && node->ne[3] == 1;
