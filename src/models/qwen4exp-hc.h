@@ -51,7 +51,8 @@ static void qwen4exp_hc_write(
 #endif
 
 static ggml_tensor * qwen4exp_hc_write_fused(
-        ggml_context * ctx, ggml_tensor * residual, ggml_tensor * block, ggml_tensor * weights) {
+        ggml_context * ctx, ggml_tensor * residual, ggml_tensor * block, ggml_tensor * weights,
+        bool inplace = false) {
     if (residual->type != GGML_TYPE_F32 || block->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
         residual->nb[0] != sizeof(float) || block->nb[0] != sizeof(float) || weights->nb[0] != sizeof(float) ||
         residual->ne[3] != 1 || block->ne[3] != 1 || weights->ne[3] != 1 ||
@@ -60,5 +61,7 @@ static ggml_tensor * qwen4exp_hc_write_fused(
         return nullptr;
     }
     const int tasks = residual->ne[2] <= 4 ? 1 : GGML_N_TASKS_MAX;
-    return ggml_map_custom3(ctx, residual, block, weights, qwen4exp_hc_write, tasks, nullptr);
+    return inplace
+        ? ggml_map_custom3_inplace(ctx, residual, block, weights, qwen4exp_hc_write, tasks, nullptr)
+        : ggml_map_custom3(ctx, residual, block, weights, qwen4exp_hc_write, tasks, nullptr);
 }

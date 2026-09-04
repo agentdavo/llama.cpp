@@ -360,7 +360,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         ggml_tensor * residual,
         ggml_tensor * block_out,
         ggml_tensor * inject,
-        int           il) {
+        int           il,
+        bool          residual_owned) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
@@ -372,7 +373,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
     const char * fusion = std::getenv("LLAMA_QWEN4EXP_HC_FUSION");
     if (fusion && std::strcmp(fusion, "1") == 0) {
-        if (ggml_tensor * cur = qwen4exp_hc_write_fused(ctx0, residual, b, w)) {
+        const char * reuse = std::getenv("LLAMA_QWEN4EXP_HC_REUSE");
+        const bool inplace = residual_owned && reuse && std::strcmp(reuse, "1") == 0;
+        if (ggml_tensor * cur = qwen4exp_hc_write_fused(ctx0, residual, b, w, inplace)) {
             cb(cur, "hc_combine", il);
             return cur;
         }
@@ -463,7 +466,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
         }
 
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
+        const bool residual_owned = !(il == n_layer - 1 && inp_out_ids && gather_now);
+        res_hc = build_hc_combine(res_hc, cur, inject, il, residual_owned);
 
         cur = build_hc_mix(res_hc,
                 model.layers[il].hc_ffn_norm,
@@ -475,7 +479,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
+        res_hc = build_hc_combine(res_hc, cur, inject, il, true);
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
@@ -678,7 +682,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
 
-    res_hc = build_hc_combine(res_hc, cur, inject, il);
+    res_hc = build_hc_combine(res_hc, cur, inject, il, inp_out_ids == nullptr);
     cb(res_hc, "mtp_hc_attn_post", il);
 
     // ---- MoE, identical to the trunk's build_layer_ffn ----
@@ -690,7 +694,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur = build_layer_ffn(cur, il);
     cb(cur, "mtp_ffn_out", il);
 
-    res_hc = build_hc_combine(res_hc, cur, inject, il);
+    res_hc = build_hc_combine(res_hc, cur, inject, il, true);
     cb(res_hc, "mtp_hc_ffn_post", il);
 
     // The next draft step re-enters here, so export the wide stream before it is collapsed.
