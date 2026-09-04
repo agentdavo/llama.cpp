@@ -352,7 +352,7 @@ class ModelBase:
                 return weight.float() * scale
 
             # ref: https://github.com/ModelCloud/GPTQModel/blob/037c5c0f6c9e33c500d975b038d02e7ca437546d/gptqmodel/nn_modules/qlinear/__init__.py#L437-L476
-            def dequant_gptq(g_idx: Tensor, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
+            def dequant_gptq(g_idx: Tensor | None, qweight: Tensor, qzeros: Tensor, scales: Tensor) -> Tensor:
                 bits = quant_config["bits"]
                 assert bits in (2, 3, 4, 8)
                 assert qweight.dtype == qzeros.dtype
@@ -387,6 +387,15 @@ class ModelBase:
                 assert zeros is not None
 
                 weight = weight.reshape(weight.shape[0] * weight.shape[1], weight.shape[2])
+
+                if g_idx is None:
+                    # Symmetric / no-act-order checkpoints (e.g. AutoRound's auto_gptq packing) omit
+                    # g_idx entirely; it is then just the identity group mapping over the input dim.
+                    group_size = quant_config["group_size"]
+                    assert isinstance(group_size, int) and group_size > 0
+                    g_idx = torch.arange(weight.shape[0], dtype=torch.int32) // group_size
+                    if self.lazy:
+                        g_idx = LazyTorchTensor.from_eager(g_idx)
 
                 # gptq_v2 doesn't need to offset zeros
                 if quant_config.get("checkpoint_format", "gptq") == "gptq":
@@ -462,11 +471,16 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith(".qscale_act"):
                         tensors_to_remove.append(name)
-            elif quant_method == "gptq":
+            elif quant_method == "gptq" or (
+                # intel/auto-round writes GPTQ-packed tensors under its own quant_method; the
+                # packing_format says which layout ("auto_round:auto_gptq" -> the gptq one above).
+                quant_method == "auto-round"
+                and str(quant_config.get("packing_format", "")).endswith("auto_gptq")
+            ):
                 for name in self.model_tensors.keys():
                     if name.endswith(".qweight"):
                         base_name = name.removesuffix(".qweight")
-                        g_idx = self.model_tensors[base_name + ".g_idx"]
+                        g_idx = self.model_tensors.get(base_name + ".g_idx", lambda: None)
                         qweight = self.model_tensors[base_name + ".qweight"]
                         qzeros = self.model_tensors[base_name + ".qzeros"]
                         scales = self.model_tensors[base_name + ".scales"]
