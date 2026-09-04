@@ -265,14 +265,24 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
 
     auto flush_cpu = [&]() {
         if (batch->n_nodes > 0) {
+            if (getenv("GGML_NPU_TRACE_NODES")) {
+                fprintf(stderr, "hpi-3720:   >> flush_cpu %d node(s)\n", batch->n_nodes); fflush(stderr);
+            }
             ggml_backend_graph_compute(ctx->cpu, batch);
+            if (getenv("GGML_NPU_TRACE_NODES")) { fprintf(stderr, "hpi-3720:   << flush_cpu ok\n"); fflush(stderr); }
             ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
             batch->n_nodes = 0;
         }
     };
     auto flush_dpu = [&]() {
         if (n_dpu > 0) {
+            if (getenv("GGML_NPU_TRACE_NODES")) {
+                fprintf(stderr, "hpi-3720:   >> flush_dpu %d op(s), first M=%lld N=%lld K=%lld\n",
+                        n_dpu, (long long) dpu_ops[0].M, (long long) dpu_ops[0].N, (long long) dpu_ops[0].K);
+                fflush(stderr);
+            }
             hpi_q8_0_gemm_batch(ctx->hpi, dpu_ops, n_dpu);
+            if (getenv("GGML_NPU_TRACE_NODES")) { fprintf(stderr, "hpi-3720:   << flush_dpu ok\n"); fflush(stderr); }
             for (int j = 0; j < n_dpu; j++) {
                 const hpi_q8_0_gemm & o = dpu_ops[j];
                 ctx->n_mul_mat++;
@@ -307,6 +317,18 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         if (node->op == GGML_OP_NONE) continue;
 
         const bool batchable = ggml_backend_npu_dpu_cacheable(node) && node->ne[2] == 1 && node->ne[3] == 1;
+        if (trace_nodes && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+            const struct ggml_tensor * s0 = node->src[0];
+            const struct ggml_tensor * s1 = node->src[1];
+            fprintf(stderr, "hpi-3720:   ^ batchable=%d s0{%s data=%p buf=%s} s1{%s data=%p buf=%s} dst data=%p\n",
+                    (int) batchable,
+                    s0 ? ggml_type_name(s0->type) : "null", s0 ? s0->data : NULL,
+                    (s0 && s0->buffer) ? ggml_backend_buffer_name(s0->buffer) : "NOBUF",
+                    s1 ? ggml_type_name(s1->type) : "null", s1 ? s1->data : NULL,
+                    (s1 && s1->buffer) ? ggml_backend_buffer_name(s1->buffer) : "NOBUF",
+                    node->data);
+            fflush(stderr);
+        }
         if (batchable) {
             flush_cpu();   // this DPU op may read a CPU-computed input -> ensure the CPU batch has run
             bool dep = false;   // never batch an op that reads a not-yet-executed batched DPU output
