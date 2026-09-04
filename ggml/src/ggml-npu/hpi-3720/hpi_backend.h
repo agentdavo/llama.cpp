@@ -14,6 +14,7 @@ struct hpi_device {
     const hpi_backend_ops *ops;   /* dispatch table for this device */
     void                  *priv;  /* backend-private state (owned by the backend) */
     hpi_device_info        info;
+    hpi_profile            profile;
 };
 
 struct hpi_backend_ops {

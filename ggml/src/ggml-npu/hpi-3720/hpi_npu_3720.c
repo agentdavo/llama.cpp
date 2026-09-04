@@ -128,6 +128,7 @@ typedef struct {
     int                       q_ok;
     npu3720_shape             cache[NPU3720_CACHE_MAX];
     int                       ncache;
+    hpi_profile              *profile;
     size_t                    blob_bytes_resident;  /* sum of blob_len over graphs the device accepted;
                                                      * printed on a graph-create failure so the ceiling
                                                      * can be read as COUNT- or MEMORY-bound. */
@@ -162,6 +163,7 @@ static hpi_status npu_open(hpi_device *dev) {
     if (!dev) return HPI_EINVAL;
     npu3720_priv *p = (npu3720_priv *)calloc(1, sizeof *p);
     if (!p) return HPI_ENOMEM;
+    p->profile = dev->profile.enabled ? &dev->profile : NULL;
 
     /* Step 1: load the Level Zero loader and open the first VPU device (+ context + graph table). */
     if (npu_ze_load(&p->z, 0) != 0) { free(p); return HPI_EDEVICE; }
@@ -354,18 +356,27 @@ static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
  * device error). Does NOT submit or read back, so many ops can be prepared then submitted as a batch. */
 static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_status *st) {
     *st = HPI_OK;
+    double t0 = p->profile ? npu_now_ms() : 0.0;
     npu3720_shape *s = shape_find(p, op);
-    if (!s) { s = shape_build(p, op, st); if (!s) return NULL; }
+    if (!s) {
+        if (p->profile) p->profile->cache_misses++;
+        s = shape_build(p, op, st);
+    }
+    if (p->profile) p->profile->prepare_ms += npu_now_ms() - t0;
+    if (!s) return NULL;
 
     const npu_graph_arg *ax = &s->g.arg[s->io.arg_x];
     /* Stage X into the device input buffer in the blob's precision. When this op uses fewer rows than
      * the shared blob's M (an M=256 prefill blob serving op->M<256), zero the buffer first so the
      * unused rows compute on zeros — their output rows are simply not read back. */
     const size_t staged = (size_t)op->M * (size_t)op->K;
+    t0 = p->profile ? npu_now_ms() : 0.0;
     if (ax->elems > staged) memset(s->x_mem, 0, ax->bytes);
     hpi_status cst = stage_in_f32(s->x_mem, ax->precision, op->x, staged);
+    if (p->profile) p->profile->input_ms += npu_now_ms() - t0;
     if (cst != HPI_OK) { *st = cst; return NULL; }
 
+    t0 = p->profile ? npu_now_ms() : 0.0;
     /* AppendGraphInitialize once per shape (loads baked weights / builds descriptors). */
     if (!s->initialized) {
         ze_command_list_handle_t li;
@@ -380,13 +391,17 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
         }
         s->exec_ready = 1;
     }
+    if (p->profile) p->profile->prepare_ms += npu_now_ms() - t0;
     return s;
 }
 
 /* Read back one prepared op's output (device precision -> host f32) after its graph has executed. */
-static void npu_finish(npu3720_shape *s, const hpi_q8_0_gemm *op) {
+static hpi_status npu_finish(npu3720_priv *p, npu3720_shape *s, const hpi_q8_0_gemm *op) {
     const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
-    stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N);
+    const double t0 = p->profile ? npu_now_ms() : 0.0;
+    const hpi_status st = stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N);
+    if (p->profile) p->profile->output_ms += npu_now_ms() - t0;
+    return st;
 }
 
 /* Uncached op -> the CPU reference (correct, not accelerated). Warns once. */
@@ -396,7 +411,36 @@ static hpi_status npu_cpu_fallback(hpi_device *dev, const hpi_q8_0_gemm *op) {
         "(uncached shape/tensor); those run on the CPU reference. Cached ops use the DPU.\n"); }
     if (getenv("GGML_NPU_VERBOSE")) fprintf(stderr, "hpi-3720: CPU-ref fallback op M=%lld N=%lld K=%lld\n",
         (long long) op->M, (long long) op->N, (long long) op->K);   /* diagnose which shapes lack a cached blob */
-    return hpi_backend_cpu()->gemm(dev, op);
+    const double t0 = dev->profile.enabled ? npu_now_ms() : 0.0;
+    const hpi_status st = hpi_backend_cpu()->gemm(dev, op);
+    if (dev->profile.enabled) {
+        dev->profile.fallback_ms += npu_now_ms() - t0;
+        dev->profile.fallback_ops++;
+    }
+    return st;
+}
+
+/* The queue is synchronous: submit_ms can include device execution. */
+static hpi_status npu_submit(npu3720_priv *p, ze_command_list_handle_t *lists, uint32_t n) {
+    double t0 = p->profile ? npu_now_ms() : 0.0;
+    ze_result_t result = p->z.zeCommandQueueExecuteCommandLists(p->q, n, lists, NULL);
+    if (p->profile) {
+        p->profile->submit_ms += npu_now_ms() - t0;
+        p->profile->submissions++;
+        p->profile->graphs += n;
+    }
+    if (result != ZE_RESULT_SUCCESS) {
+        fprintf(stderr, "hpi-3720: queue submit failed: 0x%x\n", (unsigned)result);
+        return HPI_EDEVICE;
+    }
+    t0 = p->profile ? npu_now_ms() : 0.0;
+    result = p->z.zeCommandQueueSynchronize(p->q, UINT64_MAX);
+    if (p->profile) p->profile->sync_ms += npu_now_ms() - t0;
+    if (result != ZE_RESULT_SUCCESS) {
+        fprintf(stderr, "hpi-3720: queue sync failed: 0x%x\n", (unsigned)result);
+        return HPI_EDEVICE;
+    }
+    return HPI_OK;
 }
 
 static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
@@ -405,9 +449,9 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
     hpi_status st;
     npu3720_shape *s = npu_prepare(p, op, &st);
     if (!s) return (st == HPI_UNAVAILABLE) ? npu_cpu_fallback(dev, op) : st;
-    if (npu_queue_run(&p->d, p->q, s->exec_list, UINT64_MAX) != 0) return HPI_EDEVICE;
-    npu_finish(s, op);
-    return HPI_OK;
+    st = npu_submit(p, &s->exec_list, 1);
+    if (st != HPI_OK) return st;
+    return npu_finish(p, s, op);
 }
 
 /* Batch of N INDEPENDENT ops: prepare all (stage inputs, one-time init), submit every graph in ONE
@@ -432,16 +476,23 @@ static hpi_status npu_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int 
         hpi_status st;
         sh[i] = npu_prepare(p, &ops[i], &st);
         if (!sh[i]) {
-            if (st == HPI_UNAVAILABLE) { npu_cpu_fallback(dev, &ops[i]); continue; }
+            if (st == HPI_UNAVAILABLE) {
+                st = npu_cpu_fallback(dev, &ops[i]);
+                if (st != HPI_OK) return st;
+                continue;
+            }
             return st;
         }
         lists[nlist++] = sh[i]->exec_list;
     }
     if (nlist > 0) {                                               /* phase 2: one submit + one sync for all */
-        if (p->z.zeCommandQueueExecuteCommandLists(p->q, (uint32_t)nlist, lists, NULL) != ZE_RESULT_SUCCESS) return HPI_EDEVICE;
-        if (p->z.zeCommandQueueSynchronize(p->q, UINT64_MAX) != ZE_RESULT_SUCCESS) return HPI_EDEVICE;
+        const hpi_status st = npu_submit(p, lists, (uint32_t)nlist);
+        if (st != HPI_OK) return st;
     }
-    for (int i = 0; i < n; i++) if (sh[i]) npu_finish(sh[i], &ops[i]);   /* phase 3: read outputs */
+    for (int i = 0; i < n; i++) if (sh[i]) {
+        const hpi_status st = npu_finish(p, sh[i], &ops[i]);
+        if (st != HPI_OK) return st;
+    }
     return HPI_OK;
 }
 

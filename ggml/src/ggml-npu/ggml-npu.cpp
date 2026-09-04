@@ -21,7 +21,6 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <thread>
 
 static bool ggml_backend_npu_gpu_offload(void);   // NPU_OFFLOAD_GPU: whole-layer GPU offload vs default ACCEL
 
@@ -38,6 +37,7 @@ struct ggml_backend_npu_context {
     uint64_t     n_cpu_pass = 0;  // nodes passed through to the internal CPU backend
     int64_t      max_m     = 0;   // largest M seen (diagnose prefill batching)
     bool         logged_first = false;
+    uint64_t     profile_graphs = 0;
 };
 
 // CMX FIT — MUST MIRROR re/build_blob_cache.py's cmx_need()/CMX_BUDGET EXACTLY.
@@ -138,7 +138,7 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
     GGML_ASSERT(ne00 == ne10);                       // K
     GGML_ASSERT(ne0  == ne01);                       // N
     GGML_ASSERT(ne1  == ne11);                        // M
-    GGML_ASSERT(nb00 == (int64_t) ggml_type_size(GGML_TYPE_Q8_0)); // src0 block-contiguous
+    GGML_ASSERT(nb00 == ggml_type_size(GGML_TYPE_Q8_0)); // src0 block-contiguous
     GGML_ASSERT(nb10 == (int64_t) sizeof(float));                  // src1 contiguous rows
     GGML_ASSERT(nb0  == (int64_t) sizeof(float));                  // dst  contiguous rows
 
@@ -244,6 +244,33 @@ static void ggml_backend_npu_mul_mat_id(ggml_backend_npu_context * ctx, struct g
 
 static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_npu_context * ctx = (ggml_backend_npu_context *) backend->context;
+    hpi_profile before = {};
+    GGML_ASSERT(hpi_get_profile(ctx->hpi, &before) == HPI_OK);
+    const int64_t start_us = before.enabled ? ggml_time_us() : 0;
+    double cpu_ms = 0.0;
+    uint64_t cpu_batches = 0;
+    auto report_profile = [&]() {
+        if (!before.enabled) return;
+        hpi_profile after = {};
+        GGML_ASSERT(hpi_get_profile(ctx->hpi, &after) == HPI_OK);
+        const double wall_ms = (double)(ggml_time_us() - start_us) / 1000.0;
+        const double prepare = after.prepare_ms - before.prepare_ms;
+        const double input = after.input_ms - before.input_ms;
+        const double submit = after.submit_ms - before.submit_ms;
+        const double sync = after.sync_ms - before.sync_ms;
+        const double output = after.output_ms - before.output_ms;
+        const double fallback = after.fallback_ms - before.fallback_ms;
+        // A scheduler graph view can cover part of a token. Normalize at the benchmark boundary.
+        fprintf(stderr, "NPU_PROFILE graph=%llu nodes=%d wall_ms=%.6f cpu_ms=%.6f prepare_ms=%.6f input_ms=%.6f submit_ms=%.6f sync_ms=%.6f output_ms=%.6f fallback_ms=%.6f other_ms=%.6f cpu_batches=%llu submissions=%llu graphs=%llu fallback_ops=%llu cache_misses=%llu\n",
+                (unsigned long long)++ctx->profile_graphs, cgraph->n_nodes,
+                wall_ms, cpu_ms, prepare, input, submit, sync, output, fallback,
+                wall_ms - cpu_ms - prepare - input - submit - sync - output - fallback,
+                (unsigned long long)cpu_batches,
+                (unsigned long long)(after.submissions - before.submissions),
+                (unsigned long long)(after.graphs - before.graphs),
+                (unsigned long long)(after.fallback_ops - before.fallback_ops),
+                (unsigned long long)(after.cache_misses - before.cache_misses));
+    };
 
     if (!ctx->cpu) {
         // ACCEL mode (default): the sched assigns us only our own ops (Q8_0 mul_mat + structural).
@@ -267,6 +294,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                     GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
             }
         }
+        report_profile();
         return GGML_STATUS_SUCCESS;
     }
 
@@ -312,7 +340,12 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
             if (getenv("GGML_NPU_TRACE_NODES")) {
                 fprintf(stderr, "hpi-3720:   >> flush_cpu %d node(s)\n", batch->n_nodes); fflush(stderr);
             }
-            ggml_backend_graph_compute(ctx->cpu, batch);
+            const int64_t cpu_start = before.enabled ? ggml_time_us() : 0;
+            GGML_ASSERT(ggml_backend_graph_compute(ctx->cpu, batch) == GGML_STATUS_SUCCESS);
+            if (before.enabled) {
+                cpu_ms += (double)(ggml_time_us() - cpu_start) / 1000.0;
+                cpu_batches++;
+            }
             if (getenv("GGML_NPU_TRACE_NODES")) { fprintf(stderr, "hpi-3720:   << flush_cpu ok\n"); fflush(stderr); }
             ctx->n_cpu_pass += (uint64_t) batch->n_nodes;
             batch->n_nodes = 0;
@@ -325,7 +358,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                         n_dpu, (long long) dpu_ops[0].M, (long long) dpu_ops[0].N, (long long) dpu_ops[0].K);
                 fflush(stderr);
             }
-            hpi_q8_0_gemm_batch(ctx->hpi, dpu_ops, n_dpu);
+            GGML_ASSERT(hpi_q8_0_gemm_batch(ctx->hpi, dpu_ops, n_dpu) == HPI_OK);
             if (getenv("GGML_NPU_TRACE_NODES")) { fprintf(stderr, "hpi-3720:   << flush_dpu ok\n"); fflush(stderr); }
             for (int j = 0; j < n_dpu; j++) {
                 const hpi_q8_0_gemm & o = dpu_ops[j];
@@ -406,6 +439,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     flush_dpu();
     flush_cpu();
     ggml_free(gctx);
+    report_profile();
     return GGML_STATUS_SUCCESS;
 }
 
@@ -477,16 +511,9 @@ ggml_backend_t ggml_backend_npu_init(void) {
         // GPU-passthrough mode: an internal CPU backend computes every non-DPU node of the whole layers
         // that -ngl places on us (see ggml_backend_npu_graph_compute).
         ctx->cpu = ggml_backend_cpu_init();
-        // THREAD COUNT MATTERS ENORMOUSLY HERE. In GPU-passthrough we get EVERY node of the layers
-        // -ngl placed on us and delegate all non-DPU ones to this backend — ~7700 of 7986 nodes per
-        // token on Flash-Next. ggml_backend_cpu_init() defaults to GGML_DEFAULT_N_THREADS = 4
-        // (ggml.h:232), so without this the bulk of the graph ran on 4 threads while the CPU-only
-        // comparison used all 20. MEASURED before this fix: NPU 1.17 t/s vs CPU-only 1.98 t/s — the
-        // "NPU" path was LOSING to plain CPU, and the thread count was the reason, not the DPU.
-        // GGML_NPU_CPU_THREADS overrides; default is the machine's hardware concurrency.
+        // Four threads beat larger internal pools in the Flash-Next decode sweep. The cause remains unmeasured.
         if (ctx->cpu) {
-            int nth = (int) std::thread::hardware_concurrency();
-            if (nth <= 0) nth = 4;
+            int nth = 4;
             if (const char * e = getenv("GGML_NPU_CPU_THREADS")) {
                 const int v = atoi(e);
                 if (v > 0) nth = v;

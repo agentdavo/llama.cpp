@@ -51,6 +51,15 @@ typedef struct {
     int              is_hw;     /* 1 if a real accelerator, 0 if a software reference */
 } hpi_device_info;
 
+/* Cumulative API wall times, enabled by GGML_NPU_PROFILE=1 at device open. */
+typedef struct {
+    int enabled;
+    double prepare_ms, input_ms, submit_ms, sync_ms, output_ms, fallback_ms;
+    uint64_t submissions, graphs, fallback_ops, cache_misses;
+} hpi_profile;
+
+hpi_status hpi_get_profile(const hpi_device *dev, hpi_profile *out);
+
 /*
  * Q8_0 GEMM offload — ggml mul_mat semantics.
  *

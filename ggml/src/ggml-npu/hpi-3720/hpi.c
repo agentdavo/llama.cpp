@@ -38,6 +38,8 @@ hpi_device *hpi_open(hpi_backend_kind kind, hpi_status *status) {
     dev->info.kind = ops->kind;
     dev->info.name = ops->name;
     dev->info.is_hw = ops->is_hw;
+    const char *profile = getenv("GGML_NPU_PROFILE");
+    dev->profile.enabled = profile && profile[0] && profile[0] != '0';
     st = ops->open ? ops->open(dev) : HPI_OK;
     if (st != HPI_OK) { free(dev); dev = NULL; }
     if (status) *status = st;
@@ -50,6 +52,12 @@ out:
 hpi_status hpi_get_info(const hpi_device *dev, hpi_device_info *out) {
     if (!dev || !out) return HPI_EINVAL;
     *out = dev->info;
+    return HPI_OK;
+}
+
+hpi_status hpi_get_profile(const hpi_device *dev, hpi_profile *out) {
+    if (!dev || !out) return HPI_EINVAL;
+    *out = dev->profile;
     return HPI_OK;
 }
 
