@@ -19,16 +19,15 @@ typedef struct {
     uint8_t *blob;
     size_t blob_size;
     uint8_t digest[32];
-    hpi3720_exec_slot slots[2];
     ze_command_list_handle_t init_list;
     int initialized;
 } hpi3720_program;
 
-static inline hpi3720_exec_slot *hpi3720_slot_acquire(hpi3720_program *program) {
-    for (int i = 0; i < 2; ++i) {
-        if (program->slots[i].state == HPI3720_IDLE) {
-            program->slots[i].state = HPI3720_PREPARED;
-            return &program->slots[i];
+static inline hpi3720_exec_slot *hpi3720_slot_acquire(hpi3720_exec_slot *slots, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (slots[i].state == HPI3720_IDLE) {
+            slots[i].state = HPI3720_PREPARED;
+            return &slots[i];
         }
     }
     return NULL;
@@ -60,21 +59,28 @@ static inline int hpi3720_slot_record(hpi3720_program *program, hpi3720_exec_slo
     return 0;
 }
 
-/* Call only after the queue has completed. Lists/graphs release references first. */
+/* Call only after the queue has completed. A registered weight owns its records,
+ * so their lists stay bound to that immutable allocation instead of being
+ * rerecorded when a different routed expert occupies a positional slot. */
+static inline int hpi3720_slots_destroy(hpi3720_program *program,
+                                        hpi3720_exec_slot *slots, size_t count) {
+    npu_dev *d = program->device;
+    for (size_t i = 0; i < count; ++i) {
+        if (slots[i].state == HPI3720_SUBMITTED) return -1;
+        if (slots[i].list && npu_list_destroy(d, &slots[i].list)) return -1;
+        if (slots[i].x && npu_mem_free(d, slots[i].x)) return -1;
+        slots[i].x = NULL;
+        if (slots[i].y && npu_mem_free(d, slots[i].y)) return -1;
+        slots[i].y = NULL;
+    }
+    return 0;
+}
+
+/* Call only after every registered-weight record has been destroyed. */
 static inline int hpi3720_program_destroy(hpi3720_program *program) {
     npu_dev *d = program->device;
-    for (int i = 0; i < 2; ++i) {
-        if (program->slots[i].state == HPI3720_SUBMITTED) return -1;
-        if (program->slots[i].list && npu_list_destroy(d, &program->slots[i].list)) return -1;
-    }
     if (program->init_list && npu_list_destroy(d, &program->init_list)) return -1;
     if (program->graph.h && npu_graph_destroy(&program->graph)) return -1;
-    for (int i = 0; i < 2; ++i) {
-        if (program->slots[i].x && npu_mem_free(d, program->slots[i].x)) return -1;
-        program->slots[i].x = NULL;
-        if (program->slots[i].y && npu_mem_free(d, program->slots[i].y)) return -1;
-        program->slots[i].y = NULL;
-    }
     free(program->blob);
     memset(program, 0, sizeof *program);
     return 0;

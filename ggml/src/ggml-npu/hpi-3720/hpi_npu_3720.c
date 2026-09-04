@@ -1,7 +1,8 @@
 /* Intel NPU 2.7 / VPU 3720 Q8_0 offload.
  * V2 caches own baked graphs. Opt-in v3 caches share a shape/layout program,
- * two X/Y/command slots, and immutable registered weight images. Disk cache
- * identity is validated on cold lookup; source weights stay fixed until close.
+ * persistent per-weight X/Y/command records, and immutable registered weight
+ * images. Disk cache identity is validated on cold lookup; resident weights are
+ * bounded and idle least-recently-used entries may be evicted.
  * Missing entries are reported to ggml for optimized CPU execution.
  */
 #include "hpi_backend.h"
@@ -49,6 +50,7 @@ static hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
  *  Per-shape resident state: one compiled blob + its graph + its staged, device-visible buffers.
  * ---------------------------------------------------------------------------------------------- */
 typedef struct {
+    int         valid;
     const void *w_key;               /* W pointer this blob was built for (strategy A cache key) */
     int64_t     M, N, K;
     uint8_t    *blob;                /* owned */
@@ -62,9 +64,20 @@ typedef struct {
     int         exec_ready;          /* exec_list is built + closed (re-runnable) */
     ze_command_list_handle_t init_list;
     hpi3720_program *program;
-    hpi3720_exec_slot *program_slot;
+    hpi3720_exec_slot records[2];   /* stable lists/buffers owned by this immutable weight */
+    enum hpi3720_slot_state legacy_state;
     void *weight_mem;
+    size_t weight_bytes;
+    uint64_t last_used;
 } npu3720_shape;
+
+typedef struct {
+    npu3720_shape *shape;
+    hpi3720_exec_slot *record;      /* NULL for a legacy baked-weight graph */
+    void *x_mem;
+    void *y_mem;
+    ze_command_list_handle_t exec_list;
+} npu3720_prepared;
 
 #define NPU3720_MISS_MAX 1024
 #define NPU3720_WEIGHT_MAX 1024
@@ -93,7 +106,13 @@ typedef struct {
                                                      * printed on a graph-create failure so the ceiling
                                                      * can be read as COUNT- or MEMORY-bound. */
     int simd;
+    size_t weight_bytes_resident;
+    size_t weight_budget_bytes;
+    uint64_t cache_clock;
+    uint64_t weight_evictions;
 } npu3720_priv;
+
+#define NPU3720_DEFAULT_WEIGHT_CACHE_MIB 512u
 
 static int64_t shape_capacity(const hpi_q8_0_gemm *op) {
     return op->M == 1 ? 1 : (op->M <= 256 ? 256 : op->M);
@@ -133,6 +152,14 @@ static hpi_status npu_open(hpi_device *dev) {
     p->profile = dev->profile.enabled ? &dev->profile : NULL;
     const char *simd = getenv("GGML_NPU_SIMD");
     p->simd = simd && simd[0] && simd[0] != '0' && hpi3720_has_f16c();
+    unsigned long long cache_mib = NPU3720_DEFAULT_WEIGHT_CACHE_MIB;
+    const char *cache_env = getenv("GGML_NPU_WEIGHT_CACHE_MIB");
+    if (cache_env && cache_env[0]) {
+        char *end = NULL;
+        const unsigned long long parsed = strtoull(cache_env, &end, 10);
+        if (end && !end[0] && parsed >= 1 && parsed <= 16384) cache_mib = parsed;
+    }
+    p->weight_budget_bytes = (size_t)cache_mib * 1024u * 1024u;
 
     /* Step 1: load the Level Zero loader and open the first VPU device (+ context + graph table). */
     if (npu_ze_load(&p->z, 0) != 0) { free(p); return HPI_EDEVICE; }
@@ -160,7 +187,9 @@ static hpi_status npu_open(hpi_device *dev) {
 /* Only release allocations after every command/graph reference is gone. On a
  * driver cleanup failure retain the remaining ownership record for process exit. */
 static int shape_destroy(npu3720_priv *p, npu3720_shape *s) {
-    if (!s->program) {
+    if (s->program) {
+        if (hpi3720_slots_destroy(s->program, s->records, 2)) return -1;
+    } else {
         if (npu_list_destroy(&p->d, &s->exec_list) || npu_list_destroy(&p->d, &s->init_list)) return -1;
         if (npu_graph_destroy(&s->g)) return -1;
         if (s->x_mem && npu_mem_free(&p->d, s->x_mem)) return -1;
@@ -175,15 +204,51 @@ static int shape_destroy(npu3720_priv *p, npu3720_shape *s) {
     return 0;
 }
 
+static int shape_idle(const npu3720_shape *s) {
+    if (!s->valid) return 0;
+    if (!s->program) return s->legacy_state == HPI3720_IDLE;
+    return s->records[0].state == HPI3720_IDLE && s->records[1].state == HPI3720_IDLE;
+}
+
+/* Make room only from completed runtime-weight records. Fixed array slots keep
+ * prepared pointers stable while a batch is being assembled. Returns 1 when
+ * every evictable entry is currently in flight, so the caller can drain once. */
+static int weight_cache_make_room(npu3720_priv *p, size_t bytes) {
+    if (bytes > p->weight_budget_bytes) return -2;
+    while (p->weight_bytes_resident > p->weight_budget_bytes - bytes) {
+        int victim = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < NPU3720_WEIGHT_MAX; ++i) {
+            const npu3720_shape *s = &p->cache[i];
+            if (s->program && shape_idle(s) && s->last_used < oldest) {
+                victim = i;
+                oldest = s->last_used;
+            }
+        }
+        if (victim < 0) return 1;
+        npu3720_shape *s = &p->cache[victim];
+        const size_t released = s->weight_bytes;
+        if (shape_destroy(p, s)) { p->failed = 1; return -1; }
+        memset(s, 0, sizeof *s);
+        p->weight_bytes_resident -= released;
+        --p->ncache;
+        ++p->weight_evictions;
+    }
+    return 0;
+}
+
 static void npu_close(hpi_device *dev) {
     if (!dev || !dev->priv) return;
     npu3720_priv *p = (npu3720_priv *)dev->priv;
     if (p->q && p->z.zeCommandQueueSynchronize(p->q, UINT64_MAX) != ZE_RESULT_SUCCESS) goto retain;
-    for (int i = 0; i < p->nprograms; ++i) {
-        for (int j = 0; j < 2; ++j) p->programs[i].slots[j].state = HPI3720_IDLE;
-        if (hpi3720_program_destroy(&p->programs[i])) goto retain;
+    for (int i = 0; i < NPU3720_WEIGHT_MAX; ++i) if (p->cache[i].valid) {
+        p->cache[i].legacy_state = HPI3720_IDLE;
+        for (int j = 0; j < 2; ++j) p->cache[i].records[j].state = HPI3720_IDLE;
     }
-    for (int i = 0; i < p->ncache; ++i) if (shape_destroy(p, &p->cache[i])) goto retain;
+    for (int i = 0; i < NPU3720_WEIGHT_MAX; ++i)
+        if (p->cache[i].valid && shape_destroy(p, &p->cache[i])) goto retain;
+    for (int i = 0; i < p->nprograms; ++i)
+        if (hpi3720_program_destroy(&p->programs[i])) goto retain;
     if (npu_queue_destroy(&p->d, &p->q) || npu_dev_close(&p->d) || npu_ze_unload(&p->z)) goto retain;
     free(p); dev->priv = NULL;
     return;
@@ -257,13 +322,6 @@ static hpi3720_program *program_get(npu3720_priv *p, uint8_t **blob, size_t byte
         g->arg[2].elems != (size_t)op->N) {
         goto failed;
     }
-    for (int i = 0; i < 2; ++i) {
-        program->slots[i].x = npu_mem_alloc(&p->d, NPU_MEM_HOST, 0, g->arg[0].bytes);
-        program->slots[i].y = npu_mem_alloc(&p->d, NPU_MEM_HOST, 0, g->arg[2].bytes);
-        if (!program->slots[i].x || !program->slots[i].y) {
-            goto failed;
-        }
-    }
     memcpy(program->digest, digest, 32);
     p->blob_bytes_resident += bytes;
     return program;
@@ -275,6 +333,9 @@ failed:
 
 static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_status *st) {
     if (p->ncache >= NPU3720_WEIGHT_MAX) { *st = HPI_UNAVAILABLE; return NULL; }
+    int cache_index = -1;
+    for (int i = 0; i < NPU3720_WEIGHT_MAX; ++i) if (!p->cache[i].valid) { cache_index = i; break; }
+    if (cache_index < 0) { *st = HPI_UNAVAILABLE; return NULL; }
     npu3720_shape tmp;
     memset(&tmp, 0, sizeof tmp);
     tmp.w_key = op->w; tmp.M = shape_capacity(op); tmp.N = op->N; tmp.K = op->K;
@@ -283,14 +344,25 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     if (tmp.io.arg_w >= 0) {
         if (!tmp.io.weight_image || !tmp.io.weight_image_bytes ||
             tmp.io.arg_x != 0 || tmp.io.arg_w != 1 || tmp.io.arg_y != 2) goto unavailable;
+        const int room = weight_cache_make_room(p, tmp.io.weight_image_bytes);
+        if (room != 0) {
+            *st = room == 1 ? NPU3720_RETRY_PREPARE : (room == -2 ? HPI_UNAVAILABLE : HPI_EDEVICE);
+            goto cleanup;
+        }
         tmp.program = program_get(p, &tmp.blob, tmp.blob_len, tmp.io.weight_image_bytes, op);
         if (!tmp.program) goto unavailable;
         tmp.weight_mem = npu_mem_alloc(&p->d, NPU_MEM_HOST, 0, tmp.io.weight_image_bytes);
         if (!tmp.weight_mem) goto unavailable;
         memcpy(tmp.weight_mem, tmp.io.weight_image, tmp.io.weight_image_bytes);
         free(tmp.io.weight_image); tmp.io.weight_image = NULL;
+        for (int i = 0; i < 2; ++i) {
+            tmp.records[i].x = npu_mem_alloc(&p->d, NPU_MEM_HOST, 0, tmp.program->graph.arg[0].bytes);
+            tmp.records[i].y = npu_mem_alloc(&p->d, NPU_MEM_HOST, 0, tmp.program->graph.arg[2].bytes);
+            if (!tmp.records[i].x || !tmp.records[i].y) goto unavailable;
+        }
         tmp.g = tmp.program->graph; /* metadata view; the shared program owns the graph handle */
         tmp.blob_len = 0;
+        tmp.weight_bytes = tmp.io.weight_image_bytes;
     } else {
         if (p->nlegacy >= NPU3720_CACHE_MAX) goto unavailable;
         if (npu_graph_create(&p->d, tmp.blob, tmp.blob_len, &tmp.g)) goto unavailable;
@@ -309,23 +381,34 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
         ++p->nlegacy;
         p->blob_bytes_resident += tmp.blob_len;
     }
-    p->cache[p->ncache] = tmp;
+    tmp.valid = 1;
+    tmp.last_used = ++p->cache_clock;
+    p->cache[cache_index] = tmp;
+    ++p->ncache;
+    p->weight_bytes_resident += tmp.weight_bytes;
     *st = HPI_OK;
-    return &p->cache[p->ncache++];
+    return &p->cache[cache_index];
 
 unavailable:
+    *st = HPI_UNAVAILABLE;
+cleanup:
     if (shape_destroy(p, &tmp)) {
-        p->cache[p->ncache++] = tmp;
+        tmp.valid = 1;
+        p->cache[cache_index] = tmp;
+        ++p->ncache;
         p->failed = 1;
     }
-    *st = p->failed ? HPI_EDEVICE : HPI_UNAVAILABLE;
+    if (p->failed) *st = HPI_EDEVICE;
     return NULL;
 }
 
 static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
-    for (int i = 0; i < p->ncache; i++) {
+    for (int i = 0; i < NPU3720_WEIGHT_MAX; i++) {
         npu3720_shape *s = &p->cache[i];
-        if (s->w_key == op->w && s->M == shape_capacity(op) && s->N == op->N && s->K == op->K) return s;
+        if (s->valid && s->w_key == op->w && s->M == shape_capacity(op) && s->N == op->N && s->K == op->K) {
+            s->last_used = ++p->cache_clock;
+            return s;
+        }
     }
     return NULL;
 }
@@ -337,8 +420,10 @@ static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
  * (re-runnable) exec list built. Returns the ready shape — its exec_list can then be submitted — or
  * NULL with *st set (HPI_UNAVAILABLE = no DPU blob, caller runs it on the CPU reference; else a real
  * device error). Does NOT submit or read back, so many ops can be prepared then submitted as a batch. */
-static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_status *st) {
+static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op,
+                                  hpi_status *st, npu3720_prepared *prepared) {
     *st = HPI_OK;
+    memset(prepared, 0, sizeof *prepared);
     double t0 = p->profile ? npu_now_ms() : 0.0;
     int lookup_charged = 0;
     if (p->failed) { *st = HPI_EDEVICE; return NULL; }
@@ -381,11 +466,17 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     }
     if (!s) return NULL;
 
+    prepared->shape = s;
     if (s->program) {
-        s->program_slot = hpi3720_slot_acquire(s->program);
-        if (!s->program_slot) { *st = NPU3720_RETRY_PREPARE; return NULL; }
-        s->x_mem = s->program_slot->x;
-        s->y_mem = s->program_slot->y;
+        prepared->record = hpi3720_slot_acquire(s->records, 2);
+        if (!prepared->record) { *st = NPU3720_RETRY_PREPARE; return NULL; }
+        prepared->x_mem = prepared->record->x;
+        prepared->y_mem = prepared->record->y;
+    } else {
+        if (s->legacy_state != HPI3720_IDLE) { *st = NPU3720_RETRY_PREPARE; return NULL; }
+        s->legacy_state = HPI3720_PREPARED;
+        prepared->x_mem = s->x_mem;
+        prepared->y_mem = s->y_mem;
     }
     const npu_graph_arg *ax = &s->g.arg[s->io.arg_x];
     /* Stage X into the device input buffer in the blob's precision. When this op uses fewer rows than
@@ -393,19 +484,20 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
      * unused rows compute on zeros — their output rows are simply not read back. */
     const size_t staged = (size_t)op->M * (size_t)op->K;
     t0 = p->profile ? npu_now_ms() : 0.0;
-    if (ax->elems > staged) memset(s->x_mem, 0, ax->bytes);
-    hpi_status cst = stage_in_f32(s->x_mem, ax->precision, op->x, staged, p->simd);
+    if (ax->elems > staged) memset(prepared->x_mem, 0, ax->bytes);
+    hpi_status cst = stage_in_f32(prepared->x_mem, ax->precision, op->x, staged, p->simd);
     if (p->profile) p->profile->input_ms += npu_now_ms() - t0;
     if (cst != HPI_OK) {
-        if (s->program_slot) s->program_slot->state = HPI3720_IDLE;
-        s->program_slot = NULL;
+        if (prepared->record) prepared->record->state = HPI3720_IDLE;
+        else s->legacy_state = HPI3720_IDLE;
+        memset(prepared, 0, sizeof *prepared);
         *st = cst; return NULL;
     }
     if (s->program) {
         t0 = p->profile ? npu_now_ms() : 0.0;
-        const int reuse = s->program_slot->list && s->program_slot->bound_weights == s->weight_mem && s->program->initialized;
+        const int reuse = prepared->record->list && prepared->record->bound_weights == s->weight_mem && s->program->initialized;
         double init_elapsed = 0.0;
-        const int record_status = hpi3720_slot_record(s->program, s->program_slot, s->weight_mem, p->q,
+        const int record_status = hpi3720_slot_record(s->program, prepared->record, s->weight_mem, p->q,
                                                     p->profile ? &init_elapsed : NULL);
         if (p->profile) {
             const double elapsed = npu_now_ms() - t0;
@@ -416,11 +508,12 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
             else if (!record_status) p->profile->command_records++;
         }
         if (record_status) {
-            s->program_slot->state = HPI3720_IDLE; s->program_slot = NULL;
+            prepared->record->state = HPI3720_IDLE;
+            memset(prepared, 0, sizeof *prepared);
             p->failed = 1;
             *st = HPI_EDEVICE; return NULL;
         }
-        s->exec_list = s->program_slot->list;
+        prepared->exec_list = prepared->record->list;
         return s;
     }
 
@@ -453,17 +546,21 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
         p->profile->prepare_ms += elapsed;
         p->profile->record_ms += elapsed;
     }
+    prepared->exec_list = s->exec_list;
     return s;
 }
 
 /* Read back one prepared op's output (device precision -> host f32) after its graph has executed. */
-static hpi_status npu_finish(npu3720_priv *p, npu3720_shape *s, const hpi_q8_0_gemm *op) {
+static hpi_status npu_finish(npu3720_priv *p, npu3720_prepared *prepared, const hpi_q8_0_gemm *op) {
+    npu3720_shape *s = prepared->shape;
     const npu_graph_arg *ay = &s->g.arg[s->io.arg_y];
     const double t0 = p->profile ? npu_now_ms() : 0.0;
-    const hpi_status st = stage_out_f32(op->y, ay->precision, s->y_mem, (size_t)op->M * (size_t)op->N, p->simd);
+    const hpi_status st = stage_out_f32(op->y, ay->precision, prepared->y_mem,
+                                       (size_t)op->M * (size_t)op->N, p->simd);
     if (p->profile) p->profile->output_ms += npu_now_ms() - t0;
-    if (s->program_slot) s->program_slot->state = HPI3720_IDLE;
-    s->program_slot = NULL;
+    if (prepared->record) prepared->record->state = HPI3720_IDLE;
+    else s->legacy_state = HPI3720_IDLE;
+    memset(prepared, 0, sizeof *prepared);
     return st;
 }
 
@@ -486,10 +583,13 @@ static hpi_status npu_cpu_fallback(hpi_device *dev, const hpi_q8_0_gemm *op) {
 /* API wall times include driver overhead; sync_ms is not an isolated device compute timer. */
 static hpi_status npu_submit_work(npu3720_priv *p, ze_command_list_handle_t *lists,
         uint32_t n, hpi_host_work work, void *user) {
-    for (int i = 0; i < p->nprograms; ++i) for (int j = 0; j < 2; ++j) {
-        hpi3720_exec_slot *slot = &p->programs[i].slots[j];
-        for (uint32_t k = 0; k < n; ++k)
-            if (slot->list == lists[k]) slot->state = HPI3720_SUBMITTED;
+    for (int i = 0; i < NPU3720_WEIGHT_MAX; ++i) if (p->cache[i].valid) {
+        npu3720_shape *shape = &p->cache[i];
+        for (uint32_t k = 0; k < n; ++k) {
+            if (!shape->program && shape->exec_list == lists[k]) shape->legacy_state = HPI3720_SUBMITTED;
+            for (int j = 0; shape->program && j < 2; ++j)
+                if (shape->records[j].list == lists[k]) shape->records[j].state = HPI3720_SUBMITTED;
+        }
     }
     double t0 = p->profile ? npu_now_ms() : 0.0;
     ze_result_t result = p->z.zeCommandQueueExecuteCommandLists(p->q, n, lists, NULL);
@@ -528,12 +628,13 @@ static hpi_status npu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
     if (!dev || !dev->priv || !op) return HPI_EINVAL;
     npu3720_priv *p = (npu3720_priv *)dev->priv;
     hpi_status st;
-    npu3720_shape *s = npu_prepare(p, op, &st);
+    npu3720_prepared prepared;
+    npu3720_shape *s = npu_prepare(p, op, &st, &prepared);
     if (!s) return st == HPI_UNAVAILABLE ? npu_cpu_fallback(dev, op) :
                    (st == NPU3720_RETRY_PREPARE ? HPI_EDEVICE : st);
-    st = npu_submit(p, &s->exec_list, 1);
+    st = npu_submit(p, &prepared.exec_list, 1);
     if (st != HPI_OK) return st;
-    return npu_finish(p, s, op);
+    return npu_finish(p, &prepared, op);
 }
 
 /* Batch of N INDEPENDENT ops: prepare all (stage inputs, one-time init), submit every graph in ONE
@@ -553,33 +654,25 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
         }
         return HPI_OK;
     }
-    /* A resident shape owns one input/output slot. Submit before staging that slot again. */
-    for (int i = 1; i < n; i++) for (int j = 0; j < i; j++) {
-        if (ops[i].w == ops[j].w && shape_capacity(&ops[i]) == shape_capacity(&ops[j]) &&
-            ops[i].N == ops[j].N && ops[i].K == ops[j].K) {
-            hpi_status st = npu_gemm_batch_impl(dev, ops, i, results, NULL, NULL);
-            if (st != HPI_OK) return st;
-            return npu_gemm_batch_impl(dev, ops + i, n - i, results ? results + i : NULL, work, user);
-        }
-    }
     npu3720_shape *sh[NPU_GEMM_BATCH_MAX] = {0};
+    npu3720_prepared prepared[NPU_GEMM_BATCH_MAX] = {0};
     ze_command_list_handle_t lists[NPU_GEMM_BATCH_MAX];
     int nlist = 0, begin = 0;
     for (int i = 0; i < n; ++i) {
         hpi_status st;
-        sh[i] = npu_prepare(p, &ops[i], &st);
+        sh[i] = npu_prepare(p, &ops[i], &st, &prepared[i]);
         if (!sh[i] && st == NPU3720_RETRY_PREPARE) {
             if (!nlist) return HPI_EDEVICE;
             st = npu_submit(p, lists, (uint32_t)nlist);
             if (st != HPI_OK) return st;
             for (int j = begin; j < i; ++j) if (sh[j]) {
-                st = npu_finish(p, sh[j], &ops[j]);
+                st = npu_finish(p, &prepared[j], &ops[j]);
                 if (st != HPI_OK) return st;
                 if (results) results[j] = HPI_OK;
                 sh[j] = NULL;
             }
             nlist = 0; begin = i;
-            sh[i] = npu_prepare(p, &ops[i], &st);
+            sh[i] = npu_prepare(p, &ops[i], &st, &prepared[i]);
         }
         if (!sh[i]) {
             if (st != HPI_UNAVAILABLE) return st == NPU3720_RETRY_PREPARE ? HPI_EDEVICE : st;
@@ -588,7 +681,7 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
             if (st != HPI_OK) return st;
             continue;
         }
-        lists[nlist++] = sh[i]->exec_list;
+        lists[nlist++] = prepared[i].exec_list;
     }
     if (nlist) {
         const hpi_status st = npu_submit_work(p, lists, (uint32_t)nlist, work, user);
@@ -596,7 +689,7 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
     }
     if (!nlist && work) work(user);
     for (int i = begin; i < n; ++i) if (sh[i]) {
-        const hpi_status st = npu_finish(p, sh[i], &ops[i]);
+        const hpi_status st = npu_finish(p, &prepared[i], &ops[i]);
         if (st != HPI_OK) return st;
         if (results) results[i] = HPI_OK;
     }
