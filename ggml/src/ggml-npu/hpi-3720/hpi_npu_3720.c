@@ -49,8 +49,25 @@
  * touches on the order of a dozen distinct weight tensors x {prefill M, decode M=1}; the src/ loader
  * table exposes no zeCommandList/QueueDestroy and no graph pfnDestroy wrapper, so we deliberately do
  * NOT churn these per call — we build once per shape and keep them. Raise if a model needs more. */
+/* One baked graph per distinct weight; a full model needs 100s (0.6B = 196 M=1 + 168 m256).
+ *
+ * THE REAL CEILING IS UNKNOWN. An earlier note here claimed it was COUNT-bound at ~256; that was
+ * RETRACTED after capping this value at 200 and observing the same STATUS_HEAP_CORRUPTION with only
+ * 200 graphs resident. "256" was simply the number of blobs the test model uses (305 eligible minus
+ * 48 CMX-refused = 257 authorable), not a device limit, and the matching 256-doorbell figure from the
+ * firmware RE was a coincidence. Nothing measured so far bounds the true ceiling, because every run
+ * dies of a heap-corruption bug in the blob/staging path first.
+ *
+ * 200 is therefore a conservative placeholder, not a measured limit: it is harmless, it exercises the
+ * graceful degrade-to-CPU path, and 512 was never justified by measurement either.
+ *
+ * So cap below the pool and leave headroom for the command lists we do not own (queue, UMD internals).
+ * Exceeding this now degrades to the CPU reference exactly as designed instead of corrupting memory.
+ * This is a SAFETY CAP, not a solution: weights-as-input (A2, ~10 graphs per SHAPE instead of one per
+ * WEIGHT) is what actually removes the wall. Override at build time if the pool is ever proven larger.
+ */
 #ifndef NPU3720_CACHE_MAX
-#define NPU3720_CACHE_MAX 512   /* one baked graph per distinct weight; a full model needs 100s (0.6B = 196 M=1 + 168 m256). Raised from 64 — see the full-layer-on-DPU finding. Weights-as-input (A2) collapses this to per-shape. */
+#define NPU3720_CACHE_MAX 200
 #endif
 
 /* ---------------------------------------------------------------------------------------------- *
@@ -282,6 +299,21 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     const size_t blobM = ax->elems / (size_t)op->K;
     if (blobM < (size_t)op->M || ay->elems != blobM * (size_t)op->N) {
         free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL;
+    }
+
+    if (getenv("GGML_NPU_VERBOSE")) {
+        /* Sizes at the seam between the blob's declared arg schema and what we allocate/stage. A
+         * mismatch here is the most likely source of the STATUS_HEAP_CORRUPTION seen right after the
+         * first blob loads: we allocate ax->bytes but stage op->M*op->K elements at ax->precision, and
+         * write op->M*op->N floats into the caller's y. Print all of it once so the arithmetic can be
+         * checked against the shape instead of reasoned about. */
+        fprintf(stderr, "hpi-3720: ARGS M=%lld N=%lld K=%lld | x{elems=%zu bytes=%zu prec=%d} "
+                        "y{elems=%zu bytes=%zu prec=%d} | blobM=%zu staged_in=%zu out_floats=%zu\n",
+                (long long)op->M, (long long)op->N, (long long)op->K,
+                ax->elems, ax->bytes, (int)ax->precision,
+                ay->elems, ay->bytes, (int)ay->precision,
+                blobM, (size_t)op->M * (size_t)op->K, (size_t)op->M * (size_t)op->N);
+        fflush(stderr);
     }
 
     /* Step 3: allocate NPU-visible buffers for the input and output arguments and bind them. */
