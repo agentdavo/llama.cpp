@@ -39,6 +39,29 @@ struct ggml_backend_npu_context {
     bool         logged_first = false;
 };
 
+// CMX FIT — MUST MIRROR re/build_blob_cache.py's cmx_need()/CMX_BUDGET EXACTLY.
+//
+// The M=1 template places two SLABCH weight slabs plus the fp16 output inside 1900 KiB of CMX. The
+// authoring tool SKIPS any shape that does not fit. Until this predicate existed the backend did not
+// know that, and the two silently disagreed — with a cost worse than the disagreement suggests:
+// supports_op CLAIMED a shape with no blob, so instead of running on fast ggml-cpu the op fell through
+// to the hpi SCALAR CPU reference (plain C11, no intrinsics). MEASURED on the unsloth target: 48
+// CPU-ref fallbacks PER TOKEN, all M=1 N=2560 K=6144 (ssm_out, one per layer, 15.7M MACs each) — 48
+// sizeable GEMMs per token taken off the fast path and run on the slowest path available.
+//
+// So this is not an optimization; refusing what we cannot author is strictly better than claiming it.
+// If the K-split lands (PLAN item 3) these shapes become authorable and the predicate lets them back
+// in automatically — the two definitions just have to keep agreeing.
+#define NPU_SLABCH     256                 // build_blob_cache.py SLABCH (its default, and our N%256 rule)
+#define NPU_CMX_BUDGET (1900u * 1024u)     // build_blob_cache.py CMX_BUDGET
+
+static size_t ggml_backend_npu_cmx_need(int64_t K, int64_t N) {
+    const size_t SB = (size_t) NPU_SLABCH * 16u + (size_t) NPU_SLABCH * (size_t) K;
+    const size_t s0 = ((size_t) 0x2000 + (size_t) N * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
+    const size_t s1 = (s0 + SB + 0xFFFu) & ~(size_t) 0xFFFu;
+    return s1 + SB;
+}
+
 // A cacheable Q8_0 mul_mat shape: build_blob_cache authors an M=1 (decode) blob for any N%SLABCH==0,
 // and an M<=256 (prefill) blob for K in {1024,2048}. Match that so GPU-passthrough routes exactly the
 // ops with a DPU blob to the DPU, and sends the rest (lm_head N%256!=0, M>256, K=3072 prefill) to the
@@ -52,6 +75,7 @@ static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1], M = op->ne[1];
     if (N % 256 != 0 || K % 32 != 0) return false;
+    if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // authoring tool skips it -> so must we
     if (M == 1) return true;                    // decode blob (any K)
     if (M <= 256 && (K == 1024 || K == 2048)) return true;   // prefill blob (fits CMX)
     return false;
@@ -72,6 +96,7 @@ static bool ggml_backend_npu_mmid_cacheable(const struct ggml_tensor * op) {
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1];
     if (N % 256 != 0 || K % 32 != 0) return false;
+    if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // same CMX limit as the 2D path
 
     // MEASURED 2026-09-04 (unsloth Qwen3.8-Flash-Next): claiming these is a NET LOSS today, so it is
     // opt-in. build_blob_cache.py authors blobs for 2D tensors ONLY (it skips len(ne)!=2), so a 3D
