@@ -142,6 +142,10 @@ typedef struct {
                                                      * can be read as COUNT- or MEMORY-bound. */
 } npu3720_priv;
 
+static int64_t shape_capacity(const hpi_q8_0_gemm *op) {
+    return op->M == 1 ? 1 : (op->M <= 256 ? 256 : op->M);
+}
+
 /* ---------------------------------------------------------------------------------------------- *
  *  available() / open() / close()
  * ---------------------------------------------------------------------------------------------- */
@@ -256,7 +260,7 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
 
     npu3720_shape tmp;
     memset(&tmp, 0, sizeof tmp);
-    tmp.w_key = op->w; tmp.M = op->M; tmp.N = op->N; tmp.K = op->K;
+    tmp.w_key = op->w; tmp.M = shape_capacity(op); tmp.N = op->N; tmp.K = op->K;
 
     /* Step 2 (THE SEAM): get a native blob for this shape. Unavailable until built on the box. */
     hpi_status bs = hpi_npu3720_build_blob(op, &tmp.blob, &tmp.blob_len, &tmp.io);
@@ -307,7 +311,7 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
      * npu_gemm falls back to the CPU reference. */
     if (op->K == 0 || ax->elems % (size_t)op->K != 0) { free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL; }
     const size_t blobM = ax->elems / (size_t)op->K;
-    if (blobM < (size_t)op->M || ay->elems != blobM * (size_t)op->N) {
+    if (blobM != (size_t)tmp.M || ay->elems != blobM * (size_t)op->N) {
         free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL;
     }
 
@@ -350,7 +354,7 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
 static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
     for (int i = 0; i < p->ncache; i++) {
         npu3720_shape *s = &p->cache[i];
-        if (s->w_key == op->w && s->M == op->M && s->N == op->N && s->K == op->K) return s;
+        if (s->w_key == op->w && s->M == shape_capacity(op) && s->N == op->N && s->K == op->K) return s;
     }
     return NULL;
 }
@@ -371,7 +375,7 @@ static npu3720_shape *npu_prepare(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
         /* Fixed weights/cache for this device lifetime. Avoid rehashing an entire
          * unavailable tensor on every token. Restart after changing the cache.
          * A full negative cache conservatively declines new cold shapes. */
-        const int64_t capacity = op->M == 1 ? 1 : (op->M <= 256 ? 256 : op->M);
+        const int64_t capacity = shape_capacity(op);
         int missing = p->nmisses == NPU3720_MISS_MAX;
         for (int i = 0; !missing && i < p->nmisses; ++i) {
             const npu3720_miss *m = &p->misses[i];
@@ -496,7 +500,8 @@ static hpi_status npu_gemm_batch_impl(hpi_device *dev, const hpi_q8_0_gemm *ops,
     }
     /* A resident shape owns one input/output slot. Submit before staging that slot again. */
     for (int i = 1; i < n; i++) for (int j = 0; j < i; j++) {
-        if (ops[i].w == ops[j].w && ops[i].M == ops[j].M && ops[i].N == ops[j].N && ops[i].K == ops[j].K) {
+        if (ops[i].w == ops[j].w && shape_capacity(&ops[i]) == shape_capacity(&ops[j]) &&
+            ops[i].N == ops[j].N && ops[i].K == ops[j].K) {
             hpi_status st = npu_gemm_batch_impl(dev, ops, i, results);
             if (st != HPI_OK) return st;
             return npu_gemm_batch_impl(dev, ops + i, n - i, results ? results + i : NULL);
