@@ -598,8 +598,26 @@ static const char * ggml_backend_npu_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
 }
 
+// GGML_NPU_DISABLE=1 hides the device at REGISTRATION time (device count 0), which is the only way to
+// keep this backend out of a run entirely.
+//
+// Why a registration-time opt-out is necessary: `--device none` does NOT exclude us. llama.cpp
+// unconditionally initializes every ACCEL-type device and adds it to the scheduler
+// (llama-context.cpp:341 "add ACCEL backends (such as BLAS)"), independently of the --device list --
+// and in ACCEL mode our supports_op claims Q8_0 mul_mats, so we WOULD silently compute part of a run
+// the user asked to be CPU-only. That is exactly how a "CPU baseline" gets quietly contaminated by the
+// very DPU path it is meant to validate. Reporting no device is the honest off switch.
+//
+// (In GPU-passthrough mode we report DEVICE_TYPE_GPU, so --device does gate us; this env var covers
+// both modes uniformly, so a baseline script does not have to know which mode it is in.)
+static bool ggml_backend_npu_disabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_NPU_DISABLE"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return v == 1;
+}
+
 static size_t ggml_backend_npu_reg_get_device_count(ggml_backend_reg_t reg) {
-    return 1;
+    return ggml_backend_npu_disabled() ? 0 : 1;
     GGML_UNUSED(reg);
 }
 
