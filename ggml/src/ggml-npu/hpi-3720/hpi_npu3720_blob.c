@@ -83,7 +83,14 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
     if (n <= 0 || (size_t)n >= sizeof path) return HPI_UNAVAILABLE;
 
     unsigned char *buf = NULL; size_t len = 0;
-    if (npu_read_file(path, &buf, &len) != 0) return HPI_UNAVAILABLE;   /* not cached -> CPU reference */
+    if (npu_read_file(path, &buf, &len) != 0) {                        /* not cached -> CPU reference */
+        if (getenv("GGML_NPU_VERBOSE")) { static int nmiss = 0; if (nmiss++ < 10)
+            fprintf(stderr, "hpi-3720: blob MISS key=%016llx M=%lld N=%lld K=%lld wbytes=%zu w0=%02x%02x%02x%02x\n",
+                    (unsigned long long)key, (long long)op->M, (long long)op->N, (long long)op->K, wbytes,
+                    ((const unsigned char*)op->w)[0], ((const unsigned char*)op->w)[1],
+                    ((const unsigned char*)op->w)[2], ((const unsigned char*)op->w)[3]); }
+        return HPI_UNAVAILABLE;
+    }
 
     { static int said1 = 0, said2 = 0; int *sp = (op->M == 1) ? &said1 : &said2; if (!*sp) { *sp = 1;
         fprintf(stderr, "hpi-3720: loaded DPU blob %-5s (M=%lld N=%lld K=%lld) — this op runs on the DPU.\n",

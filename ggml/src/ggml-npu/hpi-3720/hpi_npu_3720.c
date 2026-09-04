@@ -50,7 +50,7 @@
  * table exposes no zeCommandList/QueueDestroy and no graph pfnDestroy wrapper, so we deliberately do
  * NOT churn these per call — we build once per shape and keep them. Raise if a model needs more. */
 #ifndef NPU3720_CACHE_MAX
-#define NPU3720_CACHE_MAX 64
+#define NPU3720_CACHE_MAX 512   /* one baked graph per distinct weight; a full model needs 100s (0.6B = 196 M=1 + 168 m256). Raised from 64 — see the full-layer-on-DPU finding. Weights-as-input (A2) collapses this to per-shape. */
 #endif
 
 /* ---------------------------------------------------------------------------------------------- *
@@ -236,9 +236,12 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
      * rather than stage garbage. Strategy A (baked weights, arg_w < 0) is the supported path. */
     if (tmp.io.arg_w >= 0) { free(tmp.blob); *st = HPI_EDEVICE; return NULL; }
 
-    /* Step 4a: load the blob as a graph and read back its argument schema. */
+    /* Step 4a: load the blob as a graph and read back its argument schema. Graph creation can fail once
+     * the device is holding many graphs (per-weight baked blobs don't scale) — degrade GRACEFULLY to the
+     * CPU reference (HPI_UNAVAILABLE) rather than error out (HPI_EDEVICE would crash the caller's assert),
+     * so exceeding the device graph budget just means the surplus ops run on CPU. */
     if (npu_graph_create(&p->d, tmp.blob, tmp.blob_len, &tmp.g) != 0) {
-        free(tmp.blob); *st = HPI_EDEVICE; return NULL;
+        free(tmp.blob); *st = HPI_UNAVAILABLE; return NULL;
     }
 
     /* Validate the seam's arg indices against what the graph actually reports. */
@@ -339,6 +342,8 @@ static hpi_status npu_cpu_fallback(hpi_device *dev, const hpi_q8_0_gemm *op) {
     static int said = 0;
     if (!said) { said = 1; fprintf(stderr, "hpi-3720: NOTE — some Q8_0 mul_mats have no DPU blob yet "
         "(uncached shape/tensor); those run on the CPU reference. Cached ops use the DPU.\n"); }
+    if (getenv("GGML_NPU_VERBOSE")) fprintf(stderr, "hpi-3720: CPU-ref fallback op M=%lld N=%lld K=%lld\n",
+        (long long) op->M, (long long) op->N, (long long) op->K);   /* diagnose which shapes lack a cached blob */
     return hpi_backend_cpu()->gemm(dev, op);
 }
 
