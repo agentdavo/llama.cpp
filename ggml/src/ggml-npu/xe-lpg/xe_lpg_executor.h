@@ -10,6 +10,12 @@ extern "C" {
 
 typedef struct xe_lpg_executor xe_lpg_executor;
 
+/* One caller owns each executor and all returned diagnostics. Prefill/replay
+ * reject overlapping calls without modifying the active owner's state. Query
+ * methods and destruction require that owner to have finished; they are not
+ * concurrent snapshots. Expert/input pointers must remain valid until replay
+ * returns, which includes queue completion before any output is published. */
+
 typedef struct {
     uint64_t model_id;
     uint64_t epoch;
@@ -57,7 +63,8 @@ typedef struct {
 } xe_lpg_profile;
 
 xe_lpg_executor *xe_lpg_executor_create(
-        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32], int fused_list);
+        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32],
+        int fused_list, int diagnostic_output_hash);
 void xe_lpg_executor_destroy(xe_lpg_executor *executor);
 const char *xe_lpg_executor_error(const xe_lpg_executor *executor);
 void xe_lpg_executor_profile(const xe_lpg_executor *executor, xe_lpg_profile *profile);

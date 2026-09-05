@@ -127,6 +127,10 @@ gates whose long-lived server process cannot provide a destructor profile.
 `GGML_NPU_XE_LPG_FUSED_LIST=1` selects an experimental one-command-list replay
 with explicit activation and Q8_1 memory-range barriers. It defaults OFF; the
 bridge passes the parsed mode into the executor explicitly.
+`GGML_NPU_XE_LPG_OUTPUT_HASH=1` additionally hashes and logs each published
+100 KiB output for diagnostic evidence. It defaults OFF to avoid a SHA-256 pass
+and console I/O in timed execution. Completion, copying and copy verification
+remain mandatory in either mode.
 The cache key includes model and epoch identity, all three tensor identities,
 layer, storage types, layout, expert ID, and matrix dimensions. Active route
 slots cannot be evicted.
@@ -139,8 +143,13 @@ input row to Q8_K, then Level Zero replays gate, up, exact SiLU, Q8_1
 quantization, and down. It compares every down float bit-for-bit with the CPU
 result.
 
-This path does not advertise an operation through `supports_op`, alter tensor
-placement, or replace a graph result. CPU output remains authoritative. An
-invalid configuration, unsupported shape, bad expert ID, cache failure, device
-failure, or numerical mismatch skips or disables replay without changing model
-execution. The native module is driver-specific and must be supplied explicitly.
+Shadow mode retains CPU output. A separate `GGML_NPU_XE_LPG_REPLACE=1` opt-in
+can replace the exact four-node M1 gate/up/SwiGLU/down island after a 1500 MiB
+full-cache prefill and exact CPU/GPU canary. It pins the native module digest,
+waits for completion into private GPU storage, then copies and verifies the
+published output. Failure falls back to the held CPU island and disarms the
+candidate. Grouped M2--M4 evaluation intentionally uses CPU. This bridge does
+not advertise general asynchronous operations through `supports_op` or change
+the backend's synchronous scheduler contract. The native module is
+driver-specific and must be supplied explicitly. Defaults remain OFF until
+complete execution beats the matched CPU/NPU control.

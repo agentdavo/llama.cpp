@@ -110,7 +110,8 @@ ggml_backend_npu_xe_lpg *ggml_backend_npu_xe_lpg_create(const void *model_identi
     bridge->fused_list = env_enabled("GGML_NPU_XE_LPG_FUSED_LIST");
     bridge->executor = xe_lpg_executor_create(
             module, static_cast<size_t>(cache_mib) * 1024 * 1024,
-            bridge->replace_requested ? exact_module_sha256 : nullptr, bridge->fused_list ? 1 : 0);
+            bridge->replace_requested ? exact_module_sha256 : nullptr, bridge->fused_list ? 1 : 0,
+            env_enabled("GGML_NPU_XE_LPG_OUTPUT_HASH") ? 1 : 0);
     if (!bridge->executor) {
         std::fprintf(stderr, "xe-lpg: Level Zero shadow executor unavailable\n");
         delete bridge;

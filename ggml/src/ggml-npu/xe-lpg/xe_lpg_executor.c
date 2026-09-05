@@ -39,6 +39,7 @@ struct xe_lpg_executor {
     atomic_flag busy;
     int full_dirty;
     int fused_list;
+    int diagnostic_output_hash;
     char error[512];
 };
 
@@ -64,7 +65,9 @@ static int read_module(const char *path, unsigned char **data, size_t *bytes) {
         return -1;
     }
     *data = (unsigned char *)malloc((size_t)size);
-    if (!*data || fread(*data, 1, (size_t)size, file) != (size_t)size || fclose(file)) {
+    const int read_ok = *data && fread(*data, 1, (size_t)size, file) == (size_t)size;
+    const int close_ok = fclose(file) == 0;
+    if (!read_ok || !close_ok) {
         free(*data);
         *data = NULL;
         return -1;
@@ -148,7 +151,8 @@ static int resolve_slots(
 }
 
 xe_lpg_executor *xe_lpg_executor_create(
-        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32], int fused_list) {
+        const char *module_path, size_t cache_bytes, const unsigned char expected_sha256[32],
+        int fused_list, int diagnostic_output_hash) {
     xe_lpg_executor *executor = NULL;
     unsigned char *module = NULL;
     size_t module_bytes = 0;
@@ -179,6 +183,7 @@ xe_lpg_executor *xe_lpg_executor_create(
     }
     atomic_flag_clear_explicit(&executor->busy, memory_order_release);
     executor->fused_list = fused_list != 0;
+    executor->diagnostic_output_hash = diagnostic_output_hash != 0;
     size_t capacity = cache_bytes / XE_TRIPLET_BYTES;
     if (capacity > 512) capacity = 512;
     executor->capacity = (uint32_t)capacity;
@@ -249,8 +254,8 @@ uint32_t xe_lpg_executor_capacity(const xe_lpg_executor *executor) {
 
 static int executor_lock(xe_lpg_executor *executor) {
     if (!executor) return -1;
-    if (atomic_flag_test_and_set_explicit(&executor->busy, memory_order_acquire))
-        return fail(executor, "concurrent executor use");
+    /* The rejected caller must not mutate error/profile while the owner runs. */
+    if (atomic_flag_test_and_set_explicit(&executor->busy, memory_order_acquire)) return -1;
     return 0;
 }
 
@@ -370,16 +375,18 @@ static xe_lpg_replay_status replay_locked(
         return XE_LPG_REPLAY_MISMATCH;
     }
     if (output_down) {
-        unsigned char digest[SHA256_DIGEST_SIZE];
         memcpy(output_down, executor->buffers[9].data, 25600 * sizeof(float));
         if (memcmp(output_down, executor->buffers[9].data, 25600 * sizeof(float))) {
             (void)fail(executor, "replacement output copy verification");
             return XE_LPG_REPLAY_UNAVAILABLE;
         }
-        sha256_hash(digest, (const unsigned char *)output_down, 25600 * sizeof(float));
-        fprintf(stderr, "xe-lpg: replacement output propagated sha256=");
-        for (uint32_t i = 0; i < SHA256_DIGEST_SIZE; ++i) fprintf(stderr, "%02x", digest[i]);
-        fputc('\n', stderr);
+        if (executor->diagnostic_output_hash) {
+            unsigned char digest[SHA256_DIGEST_SIZE];
+            sha256_hash(digest, (const unsigned char *)output_down, 25600 * sizeof(float));
+            fprintf(stderr, "xe-lpg: replacement output propagated sha256=");
+            for (uint32_t i = 0; i < SHA256_DIGEST_SIZE; ++i) fprintf(stderr, "%02x", digest[i]);
+            fputc('\n', stderr);
+        }
     }
     executor->profile.exact_replays++;
     return XE_LPG_REPLAY_EXACT;
