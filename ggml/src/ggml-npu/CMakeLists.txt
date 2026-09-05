@@ -1,13 +1,12 @@
 # ggml-npu — Intel NPU 2.7 / VPU 3720 backend.
 #
 # The backend glue (ggml-npu.cpp) plus the cross-platform hpi-3720 Host-Platform Interface compiled
-# straight in (the CPU reference; the real VPU-3720 path is stubbed behind HPI_HAVE_NPU_3720). No NPU
-# or OS-specific dependency, so it builds and enumerates as a device on any platform.
+# straight in. The portable CPU reference has no NPU dependency; the optional
+# HPI_HAVE_NPU_3720 path supplies the Windows Level Zero runtime and blob loader.
 
 ggml_add_backend_library(ggml-npu
                          ggml-npu.cpp
                          hpi-3720/hpi.c
-                         hpi-3720/hpi_cpu.c
                          hpi-3720/hpi_npu_3720.c
                          hpi-3720/hpi_npu3720_blob.c
                         )
@@ -37,11 +36,6 @@ if (GGML_NPU_HW)
     target_sources(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor/hash/sha256/sha256.c)
     target_include_directories(ggml-npu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../vendor/hash)
 
-    # The blob compute seam (hpi_npu3720_build_blob) is a separate TU implemented on the box; define
-    # HPI_NPU3720_BLOB_READY once it exists so npu_available() advertises the device. Until then the
-    # backend stays honest (reports unavailable, AUTO falls back to the CPU reference).
-    #   target_compile_definitions(ggml-npu PRIVATE HPI_NPU3720_BLOB_READY)
-    #   target_sources(ggml-npu PRIVATE ${NPU_BLOB_IMPL})
 endif()
 
 if (GGML_NPU_XE_LPG)

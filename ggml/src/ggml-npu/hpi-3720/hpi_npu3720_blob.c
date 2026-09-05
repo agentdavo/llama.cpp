@@ -8,8 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "hpi_npu3720_blob.h"
-#include "hpi_q8_0.h"
+#include "hpi_npu_internal.h"
 #include "sha256/sha256.h"
 
 #define NPU_CACHE_HEADER 128u

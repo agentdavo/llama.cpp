@@ -10,7 +10,7 @@ Usage:  python3 make_tiny_q8_0_gguf.py [out.gguf]
 Requires: numpy, and gguf-py on sys.path (this file lives inside the llama.cpp tree).
 """
 import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "gguf-py"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "..", "gguf-py"))
 import numpy as np
 import gguf
 from gguf import GGUFWriter, GGMLQuantizationType

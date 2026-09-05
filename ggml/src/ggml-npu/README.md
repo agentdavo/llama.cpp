@@ -53,7 +53,7 @@ reference — selecting it is correctness/plumbing, not speed, until the silicon
 Synthesize a tiny valid Q8_0 llama model, then run it and watch the backend log its work:
 
 ```sh
-python3 ggml/src/ggml-npu/hpi-3720/make_tiny_q8_0_gguf.py /tmp/tiny-q8_0.gguf   # needs numpy
+python3 ggml/src/ggml-npu/hpi-3720/tools/make_tiny_q8_0_gguf.py /tmp/tiny-q8_0.gguf   # needs numpy
 GGML_NPU_VERBOSE=1 ./build/bin/llama-bench -m /tmp/tiny-q8_0.gguf -ngl 999 --device hpi-3720 -p 16 -n 8
 ```
 

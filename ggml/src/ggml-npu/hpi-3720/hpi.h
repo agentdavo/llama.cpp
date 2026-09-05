@@ -14,15 +14,122 @@
  * passes it in — no globals), every entry point returns a checked status, and the pure math (the
  * GEMM, the Q8_0 (de)quant) is separated from the effectful device path.
  *
- * Status: SCAFFOLD. The op contract and the CPU reference are real and tested; the NPU_3720 backend
- * is a stub until the JSM/DMA path (src/ze_npu*) is wired to a Q8_0 GEMM schedule. See README.md.
+ * The CPU reference is always available. The optional Windows hardware path uses checked
+ * Level Zero execution and a versioned blob cache. Missing blobs remain unavailable. See README.md.
  */
 #ifndef HPI_H
 #define HPI_H
 
 #include <stdint.h>
 #include <stddef.h>
-#include "hpi_q8_0.h"
+/* Portable FP16 conversion and the byte-exact Q8_0 block/row helpers. */
+
+/* uint16_t IEEE-754 binary16 -> float. Matches ggml_half semantics (ggml-common.h). */
+static inline float hpi_f16_to_f32(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t exp  = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;                         /* +/- zero */
+        } else {
+            /* subnormal half -> normalized float */
+            uint32_t e = 0, m = mant;
+            while (!(m & 0x400u)) { m <<= 1; e++; }
+            m &= 0x3FFu;
+            bits = sign | ((uint32_t)(127 - 15 - e + 1) << 23) | (m << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13); /* inf / nan */
+    } else {
+        bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+    }
+    float f;
+    /* type-pun through memcpy, never an incompatible pointer cast (src/npu.h rule) */
+    __builtin_memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+/* float -> uint16_t IEEE-754 binary16, round-to-nearest-even, saturating to +/- inf. */
+static inline uint16_t hpi_f32_to_f16(float f) {
+    uint32_t x;
+    __builtin_memcpy(&x, &f, sizeof x);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    const int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+
+    if (((x >> 23) & 0xFFu) == 0xFFu) {                 /* inf / nan */
+        return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u));
+    }
+    if (exp >= 0x1F) {                                  /* overflow -> inf */
+        return (uint16_t)(sign | 0x7C00u);
+    }
+    if (exp <= 0) {                                     /* subnormal / underflow */
+        if (exp < -10) return (uint16_t)sign;          /* too small -> +/- 0 */
+        mant |= 0x800000u;
+        const uint32_t shift = (uint32_t)(14 - exp);
+        const uint32_t round = 1u << (shift - 1);
+        uint32_t v = mant + round;
+        if ((mant & ((round << 1) - 1)) == round) v = mant + round - ((v >> shift) & 1u); /* ties-to-even */
+        return (uint16_t)(sign | (v >> shift));
+    }
+    /* normal: round mantissa from 23 to 10 bits, ties-to-even */
+    const uint32_t round = 0x1000u;                     /* half of the dropped 13-bit field */
+    uint32_t v = mant + round + ((mant >> 13) & 1u);
+    uint32_t out_exp  = (uint32_t)exp;
+    uint32_t out_mant = v >> 13;
+    if (out_mant & 0x400u) { out_mant = 0; out_exp++; } /* mantissa carry */
+    if (out_exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+    return (uint16_t)(sign | (out_exp << 10) | (out_mant & 0x3FFu));
+}
+
+#include <assert.h>
+#include <math.h>
+
+#define HPI_QK8_0 32   /* elements per Q8_0 block — ggml QK8_0 */
+
+typedef struct {
+    uint16_t d;              /* fp16 scale (ggml_half) — delta */
+    int8_t   qs[HPI_QK8_0];  /* signed 8-bit quants */
+} hpi_block_q8_0;
+
+/* ABI guard: the whole point of mirroring ggml is that this stays true. */
+static_assert(sizeof(hpi_block_q8_0) == sizeof(uint16_t) + HPI_QK8_0, "hpi_block_q8_0 must be 34 bytes, matching ggml block_q8_0");
+
+/* Dequantize one block to `HPI_QK8_0` floats. Pure; no state. */
+static inline void hpi_q8_0_dequant_block(const hpi_block_q8_0 *b, float *out) {
+    const float d = hpi_f16_to_f32(b->d);
+    for (int i = 0; i < HPI_QK8_0; i++) out[i] = (float)b->qs[i] * d;
+}
+
+/*
+ * Quantize one row of `k` floats (k must be a multiple of HPI_QK8_0) into `k / HPI_QK8_0` blocks.
+ * Matches ggml quantize_row_q8_0: per block d = max(|x|)/127, qs[i] = round(x[i]/d) (nearest).
+ * Returns 0 on success, -1 if k is not block-aligned.
+ */
+static inline int hpi_q8_0_quantize_row(const float *x, hpi_block_q8_0 *blocks, int64_t k) {
+    if (k % HPI_QK8_0 != 0) return -1;
+    const int64_t nb = k / HPI_QK8_0;
+    for (int64_t b = 0; b < nb; b++) {
+        const float *xb = x + b * HPI_QK8_0;
+        float amax = 0.0f;
+        for (int i = 0; i < HPI_QK8_0; i++) {
+            const float a = fabsf(xb[i]);
+            if (a > amax) amax = a;
+        }
+        const float d  = amax / 127.0f;
+        const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+        blocks[b].d = hpi_f32_to_f16(d);
+        for (int i = 0; i < HPI_QK8_0; i++) {
+            const float v = xb[i] * id;
+            /* round-half-away-from-zero, as ggml's roundf-based path does */
+            blocks[b].qs[i] = (int8_t)lroundf(v);
+        }
+    }
+    return 0;
+}
+
 
 #ifdef __cplusplus
 extern "C" {

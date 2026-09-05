@@ -1,96 +1,72 @@
-# hpi-3720 — Host-Platform Interface for the Intel NPU 2.7 (VPU 3720)
+# hpi-3720 � Host-Platform Interface for Intel NPU 2.7 / VPU 3720
 
-The thin C ABI the `ggml-npu` host backend calls to offload a **Q8_0 GEMM** to the Intel NPU. It
-abstracts over *who computes* so the same call site runs on a portable CPU reference today and on the
-real NPU once the hardware path exists.
-
-This is the NPU analog of `ggml-hexagon/htp/` (the Hexagon DSP device layer): the host backend stays
-thin, and the accelerator-specific work — memory staging, the compute schedule, the submit/sync — lives
-behind this interface.
+HPI exposes the C ABI used by `ggml-npu` for Q8_0 GEMM. The portable CPU
+reference is always available. The optional Windows backend stages memory,
+loads checked native blobs and submits Level Zero graphs. Missing or invalid
+cache entries remain unavailable so the caller can use its CPU path.
 
 ## Files
 
-| File | Role |
-|------|------|
-| `hpi.h` | Public API: `hpi_open` / `hpi_q8_0_gemm_run` / `hpi_close`, `hpi_q8_0_gemm` op, status codes |
-| `hpi_q8_0.h` | `hpi_block_q8_0` (byte-exact mirror of ggml `block_q8_0`, 34 B) + portable row quantizer |
-| `hpi_fp16.h` | Portable IEEE-754 half↔float (software fallback; F16C on a HW build) |
-| `hpi_backend.h` | Internal seam: the backend vtable (`hpi_backend_ops`) and the device struct |
-| `hpi.c` | Dispatcher: shape validation + backend selection (AUTO → NPU if usable, else CPU) |
-| `hpi_cpu.c` | Portable CPU reference backend — the golden reference the NPU path must match |
-| `hpi_npu_3720.c` | The real VPU-3720 backend — **plumbing wired, one compute seam open**, guarded by `HPI_HAVE_NPU_3720` |
-| `hpi_gguf.h` / `hpi_gguf.c` | Minimal read-only GGUF parser (enumerate tensors, reach Q8_0 bytes) |
-| `gguf_q8_0_offload.c` | Tool: point the offload at a real `.gguf` (`--list` / `--tensor` / `--rows` / `--check`) |
-| `test/test_q8_0_gemm.c` | Deterministic GEMM self-test vs. an independent double-precision reference |
-| `test/test_gguf.c` | Writes a synthetic Q8_0 GGUF, reads it back, and offloads it end to end |
+| File | Responsibility |
+|---|---|
+| `hpi.h` | Public ABI, 34-byte Q8_0 block, portable FP16 conversions and row quantization |
+| `hpi.c` | Shape validation, backend selection and portable CPU reference |
+| `hpi_backend.h` | Private device structure and backend operation table |
+| `hpi_npu_3720.c` | Device ownership, staging, graph records and execution |
+| `hpi_npu_internal.h` | Pure repacking/residency and opt-in SIMD helpers, shared blob contract |
+| `hpi_npu3720_slots.h` | Execution-slot ownership helpers, also checked with mock device types |
+| `hpi_npu3720_blob.c` | Versioned disk-cache loading and identity validation |
+| `hpi_gguf.h` / `hpi_gguf.c` | Public read-only GGUF reader |
+| `tools/` | GGUF offload CLI and tiny Q8_0 fixture generator |
+| `test/` | CPU GEMM, GGUF and pure expert-cache checks |
 
-## The op
+Pure data helpers share one internal header. Execution slots remain separate
+because their tests supply mock device types. SIMD conversion is enabled in the internal header by
+`HPI_NPU_INTERNAL_SIMD`, defined before its first include and after `npu.h`,
+whose scalar functions define its rounding and NaN policy. This keeps its
+exhaustive pure conversion test independent of the runtime. No compatibility include stubs are retained.
 
-`hpi_q8_0_gemm` follows ggml `mul_mat` semantics:
+## Operation and ownership
 
 ```
-weights W : N × K, Q8_0-quantized   (N rows, each K/32 contiguous hpi_block_q8_0)
-input   X : M × K, float32          (row-major)
-output  Y : M × N, float32          Y[m,n] = Σ_k dequant(W[n,k]) · X[m,k]
+W : N x K, Q8_0 (N contiguous rows of K/32 hpi_block_q8_0 blocks)
+X : M x K, float32
+Y : M x N, float32; Y[m,n] = sum_k dequant(W[n,k]) * X[m,k]
 ```
 
-`K` must be a multiple of 32 (`HPI_QK8_0`). All buffers are caller-owned host memory; a backend
-copies/stages in and out as needed (the NPU path will move them into NPU-visible memory).
+`K` must be divisible by `HPI_QK8_0` (32). Callers own the host buffers and
+`hpi_device`; the backend owns its explicit private state and staging resources.
+The CPU reference retains its per-block accumulation order. The public block
+layout is guarded by a compile-time size assertion. Dispatcher validation,
+status codes, function signatures and numerical bodies are unchanged by the
+file consolidation.
 
-## Build & test (standalone, cross-platform)
+## Build and test
+
+From this directory:
 
 ```sh
-cmake -S . -B build -DHPI3720_BUILD_TESTS=ON
+cmake -S . -B build -DHPI3720_BUILD_TESTS=ON -DCMAKE_C_FLAGS=-Werror
 cmake --build build
 ctest --test-dir build --output-on-failure
-```
-
-Verified with gcc and clang under the project's strict set
-(`-std=c11 -Wall -Wextra -Wpedantic -Werror -Wconversion -Wshadow -Wcast-align -Wpointer-arith`).
-The tests use fixed seeds and fixed shapes and compare against a reference accumulated in `double`
-over the *same* quantized weights (so only float-vs-double accumulation differs) — max relative error
-is ~1e-4.
-
-### Offload a real model
-
-```sh
-# once you have a Q8_0 GGUF (e.g. Qwen3.5-0.8B-Q8_0.gguf) on a machine that can reach Hugging Face:
-./build/gguf_q8_0_offload model.gguf --list                 # list its Q8_0 tensors
+./build/gguf_q8_0_offload model.gguf --list
 ./build/gguf_q8_0_offload model.gguf --tensor <name> --rows 32 --check
+python tools/make_tiny_q8_0_gguf.py tiny-q8_0.gguf
 ```
 
-`test_gguf` leaves a small `hpi_synth_q8_0.gguf` you can feed to the tool without any download.
+The fixture generator needs NumPy and the checkout's `gguf-py`. Its random model
+is only a path test. `test_gguf` also creates a small `hpi_synth_q8_0.gguf`.
+The deterministic CPU GEMM test compares the same quantized weights against
+independent double-precision accumulation; it does not exercise the NPU.
 
-## Design notes (from the `agentdavo/npu` Carmack discipline)
+For integrated hardware builds, `GGML_NPU_HW=ON` adds the Windows runtime,
+blob-loader translation unit, SHA256 source and required include paths.
+`HPI_HAVE_NPU_3720` selects the runtime and `HPI_NPU3720_BLOB_READY` selects the
+provider. `NPU_BLOB_CACHE` identifies the existing versioned cache at runtime.
+The standalone `HPI3720_HAVE_NPU` option includes the runtime but deliberately
+leaves the provider unavailable unless supplied by its caller. Override
+`NPU_SRC_DIR`, `LEVEL_ZERO_INCLUDE` and `NPU_EXT_INCLUDE` for another layout.
 
-- **State is explicit.** The caller owns an `hpi_device` and passes it in; no globals. Each backend
-  carries its own ops table and private state.
-- **Pure vs. effectful split.** The GEMM math and the Q8_0 (de)quant are pure and live in headers /
-  `hpi_cpu.c`; device open/submit/readback (the effects) live in the backend.
-- **Every entry point returns a checked status**; the dispatcher validates shapes before dispatch.
-- **ABI is machine-checked.** `static_assert(sizeof(hpi_block_q8_0) == 34)` keeps the block in lock-step
-  with ggml.
-- **No unverified hardware claims.** `hpi_npu_3720.c` reports `HPI_UNAVAILABLE` until a real Q8_0
-  schedule runs on silicon — it never fakes a result.
-
-## Implementing the NPU-3720 path
-
-The plumbing is now written in `hpi_npu_3720.c` (guarded by `HPI_HAVE_NPU_3720`). Building with
-`-DGGML_NPU_HW=ON` (or `-DHPI3720_HAVE_NPU=ON` for the standalone lib) auto-wires the `src/` toolkit
-and the Level Zero / NPU-extension include paths (override `NPU_SRC_DIR`, `LEVEL_ZERO_INCLUDE`,
-`NPU_EXT_INCLUDE` on the cmake line if your checkout differs). Of the verified `src/` ladder:
-
-1. `npu_ze_load` + `npu_dev_open` — **done** (device + context + graph table, cached in `open()`).
-2. Build/load a **Q8_0 GEMM schedule blob** for the shape — **the one open seam**,
-   `hpi_npu3720_build_blob()`. *Blocked on the NCE descriptor layout / an OpenVINO compile — see the
-   outer CLAUDE.md "long game" and `re/FINDINGS.md` (per-channel dequant compiles; per-block does not).*
-3. `npu_mem_alloc` NPU-visible buffers; stage `X` in, `Y` out — **done** (per-shape cache, f32↔fp16).
-4. `npu_graph_create` → init → exec (`VPU_CMD_INFERENCE_EXECUTE`) → read back `Y` — **done**.
-
-`npu_available()` is gated by `HPI_NPU3720_BLOB_READY` (the same macro that supplies step 2), so until
-a real blob exists the backend reports **unavailable** and `HPI_BACKEND_AUTO` falls back to the CPU
-reference — it never fakes a result. On the box: implement the seam as a separate TU, add it to the
-build, define `HPI_NPU3720_BLOB_READY`, and flip nothing else.
-
-> The `HPI_HAVE_NPU_3720` branch has not been compiled in CI (it needs the Windows Level Zero stack);
-> it is a reviewed, `-Wall -Wextra -Wconversion`-clean scaffold. Compile it on the box first.
+Hardware progress and measured placement limits live in the outer repository's
+`re/FINDINGS.md` and `re/PLAN.md`. File consolidation does not change routing or
+establish a new hardware numerical/performance result.

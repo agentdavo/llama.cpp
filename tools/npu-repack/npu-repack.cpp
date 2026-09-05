@@ -1,7 +1,7 @@
 // npu-repack - measure and emit DPU-consumable weights from a mixed-quant GGUF (e.g. GSQ-RCO).
 //
 // The 3720 DPU applies its requant scale per output channel (VpuDPUInvariantRegisters ppe_scale, and
-// the per-channel table in the slab image of hpi_npu3720_repack.h). It has no per-K-block scale. GGUF
+// the per-channel table in the slab image of hpi_npu_internal.h). It has no per-K-block scale. GGUF
 // k-quants and i-quants all scale along K in 32- or 256-wide groups, so no GGUF type is directly
 // DPU-consumable, whatever the wmode.
 //
@@ -21,7 +21,7 @@
 #include "ggml.h"
 #include "gguf.h"
 
-#include "../../ggml/src/ggml-npu/hpi-3720/hpi_npu3720_repack.h"   // the proven Q8_0 layout, for --verify-repack
+#include "../../ggml/src/ggml-npu/hpi-3720/hpi_npu_internal.h"   // the proven Q8_0 layout, for --verify-repack
 
 #include <algorithm>
 #include <cmath>
@@ -38,7 +38,7 @@
 namespace {
 
 // bits = DPU wmode width (8 -> I8, 4 -> I4). G = K columns sharing one scale; G == 0 means the whole
-// row, which is the layout hpi_npu3720_repack.h emits and the only one that is a single workload.
+// row, which is the layout hpi_npu_internal.h emits and the only one that is a single workload.
 struct scheme {
     const char * name;
     int          bits;
@@ -109,7 +109,7 @@ struct acc {
     int64_t bytes   = 0;
 };
 
-// Slab layout, verbatim from hpi_npu3720_repack.h (SWZ=0):
+// Slab layout, verbatim from hpi_npu_internal.h (SWZ=0):
 //   [ slabch x 16B {u32 data_off, u32 0x00ffffff, f32 sw, u32 0} ][ slabch x K int8 rows ]
 // data_off is relative to the slab base; the loader relocates it. Only the source of the floats
 // differs from hpi_repack_q8_0: ggml to_float, so any quant type works.

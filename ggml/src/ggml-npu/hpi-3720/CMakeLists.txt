@@ -1,9 +1,8 @@
 # ggml-npu / hpi-3720 — Host-Platform Interface for the Intel NPU 2.7 (VPU 3720).
 #
 # Standalone, cross-platform static library (C11, no ggml/CPU-feature dependencies) that provides the
-# Q8_0 GEMM offload seam with a portable CPU reference. It is intentionally NOT yet wired into the
-# ggml backend registry (ggml/src/CMakeLists.txt ggml_add_backend) so it cannot break the main build;
-# add it there once the NPU_3720 path is real. See README.md.
+# Q8_0 GEMM offload seam with a portable CPU reference. The parent ggml-npu CMake
+# target embeds the same dispatcher/runtime sources. See README.md.
 #
 # Build & test standalone:
 #     cmake -S . -B build -DHPI3720_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build
@@ -19,7 +18,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(hpi3720 STATIC
     hpi.c
-    hpi_cpu.c
     hpi_npu_3720.c
     hpi_gguf.c)
 
@@ -41,14 +39,14 @@ if (HPI3720_HAVE_NPU)
     # Define HPI_NPU3720_BLOB_READY and add the blob-seam TU once the compute path exists on the box.
 endif()
 
-# Warnings-as-errors on the pure code (outer CLAUDE.md rule 1), where the compiler supports it.
+# Strict warnings on the pure code; verification adds -Werror.
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(hpi3720 PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wcast-align -Wpointer-arith)
 endif()
 
 # gguf_q8_0_offload: point the offload at a real .gguf model (or the synthetic one from the tests).
-add_executable(gguf_q8_0_offload gguf_q8_0_offload.c)
+add_executable(gguf_q8_0_offload tools/gguf_q8_0_offload.c)
 target_link_libraries(gguf_q8_0_offload PRIVATE hpi3720)
 if (NOT WIN32)
     target_link_libraries(gguf_q8_0_offload PRIVATE m)
@@ -56,7 +54,7 @@ endif()
 
 if (HPI3720_BUILD_TESTS)
     enable_testing()
-    foreach (t test_q8_0_gemm test_gguf)
+    foreach (t test_q8_0_gemm test_gguf test_expert_cache)
         add_executable(${t} test/${t}.c)
         target_link_libraries(${t} PRIVATE hpi3720)
         if (NOT WIN32)

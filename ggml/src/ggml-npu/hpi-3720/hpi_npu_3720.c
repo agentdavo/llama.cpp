@@ -19,7 +19,8 @@
 #define NPU_NO_GDN
 #endif
 #include "npu.h"
-#include "hpi_npu3720_simd.h"
+#define HPI_NPU_INTERNAL_SIMD
+#include "hpi_npu_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,6 @@
 #define NPU3720_CACHE_MAX 200
 #endif
 
-#include "hpi_npu3720_blob.h"   /* hpi_npu3720_blob_io + (when a provider is compiled in) build_blob's prototype */
 
 #if !defined(HPI_NPU3720_BLOB_READY)
 /* No provider TU (hpi_npu3720_blob.c) compiled in: the seam is unavailable, so the backend reports

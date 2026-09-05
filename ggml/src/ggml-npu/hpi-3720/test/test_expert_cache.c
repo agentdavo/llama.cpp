@@ -1,4 +1,4 @@
-#include "hpi_npu3720_expert_cache.h"
+#include "hpi_npu_internal.h"
 
 #include <stdio.h>
 

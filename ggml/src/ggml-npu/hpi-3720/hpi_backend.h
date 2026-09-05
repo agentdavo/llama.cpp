@@ -1,6 +1,6 @@
 /*
  * hpi_backend.h — internal seam between the HPI dispatcher (hpi.c) and a concrete backend
- * (hpi_cpu.c, hpi_npu_3720.c). Not a public header. Each backend is a small explicit vtable;
+ * (hpi.c, hpi_npu_3720.c). Not a public header. Each backend is a small explicit vtable;
  * no globals, the device carries its own ops and private state.
  */
 #ifndef HPI_BACKEND_H
