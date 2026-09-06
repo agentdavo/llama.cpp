@@ -1527,6 +1527,9 @@ class TextModel(ModelBase):
         if chkhsh == "bba3b3366b646dbdded5dbc42d59598b849371afc42f7beafa914afaa5b70aa6":
             # ref: https://huggingface.co/tencent/Hunyuan-4B-Instruct
             res = "hunyuan-dense"
+        if chkhsh == "e6ddf9c6686791c12d698d34c31ab9be1fea9af5a3d9a6909783ab382198ae1c":
+            # ref: https://huggingface.co/tencent/Hy4-preview
+            res = "hy_v4"
         if chkhsh == "a6b57017d60e6edb4d88ecc2845188e0eb333a70357e45dcc9b53964a73bbae6":
             # ref: https://huggingface.co/tiiuae/Falcon-H1-0.5B-Base
             res = "falcon-h1"
@@ -1560,6 +1563,9 @@ class TextModel(ModelBase):
         if chkhsh == "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7":
             # ref: https://huggingface.co/LiquidAI/LFM2.5-8B-A1B
             res = "lfm2"
+        if chkhsh == "0a766d034107bc736a3f2dc4968fd62e54a3570f1454443e0c5a4cc6bd7941ed":
+            # ref: https://huggingface.co/XHToken/Spark-X2.5-1.7B
+            res = "spark2_5"
         if chkhsh == "0ef9807a4087ebef797fc749390439009c3b9eda9ad1a097abbe738f486c01e5":
             # ref: https://huggingface.co/meta-llama/Meta-Llama-3-8B
             res = "llama-bpe"

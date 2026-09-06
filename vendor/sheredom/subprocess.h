@@ -705,14 +705,14 @@ int subprocess_create_named_pipe_helper(void **rd, void **wr) {
 
   *rd =
       CreateNamedPipeA(name, pipeAccessInbound | fileFlagOverlapped,
-                       pipeTypeByte | pipeWait, 1, 4096, 4096, SUBPROCESS_NULL,
+                       pipeTypeByte | pipeWait, 1, 4096, 4096, 0,
                        SUBPROCESS_PTR_CAST(LPSECURITY_ATTRIBUTES, &saAttr));
 
   if (invalidHandleValue == *rd) {
     return -1;
   }
 
-  *wr = CreateFileA(name, genericWrite, SUBPROCESS_NULL,
+  *wr = CreateFileA(name, genericWrite, 0,
                     SUBPROCESS_PTR_CAST(LPSECURITY_ATTRIBUTES, &saAttr),
                     openExisting, fileAttributeNormal, SUBPROCESS_NULL);
 
@@ -1102,7 +1102,7 @@ int subprocess_create_ex(const char *const commandLine[], int options,
 
     // Quote the argument if it has a space in it
     need_quoting = strpbrk(commandLine[i], "\t\v ") != SUBPROCESS_NULL ||
-                   commandLine[i][0] == SUBPROCESS_NULL;
+                   commandLine[i][0] == '\0';
     if (need_quoting)
       len += 2;
 
@@ -1143,7 +1143,7 @@ int subprocess_create_ex(const char *const commandLine[], int options,
     }
 
     need_quoting = strpbrk(commandLine[i], "\t\v ") != SUBPROCESS_NULL ||
-                   commandLine[i][0] == SUBPROCESS_NULL;
+                   commandLine[i][0] == '\0';
     if (need_quoting) {
       commandLineCombined[len++] = '"';
     }
