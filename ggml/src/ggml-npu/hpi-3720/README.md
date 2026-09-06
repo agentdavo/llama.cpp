@@ -62,7 +62,11 @@ independent double-precision accumulation; it does not exercise the NPU.
 For integrated hardware builds, `GGML_NPU_HW=ON` adds the Windows runtime,
 blob-loader translation unit, SHA256 source and required include paths.
 `HPI_HAVE_NPU_3720` selects the runtime and `HPI_NPU3720_BLOB_READY` selects the
-provider. `NPU_BLOB_CACHE` identifies the existing versioned cache at runtime.
+provider. `NPU_BLOB_CACHE` identifies the existing versioned cache at runtime: v2 entries are
+baked single-tile graphs (`v2_*_m1.npub`, `_m256` prefill); v3 entries are shape-only two-tile
+programs under `programs/` plus per-weight images `v3_*_m1.npui` (1-row) and `v3_*_m8.npui`
+(8-row, rows zero-padded, used for M in 2..8 and as the fallback for M=1). The queue is turbo and
+staging is F16C unless `GGML_NPU_TURBO=0` / `GGML_NPU_SIMD=0`.
 The standalone `HPI3720_HAVE_NPU` option includes the runtime but deliberately
 leaves the provider unavailable unless supplied by its caller. Override
 `NPU_SRC_DIR`, `LEVEL_ZERO_INCLUDE` and `NPU_EXT_INCLUDE` for another layout.

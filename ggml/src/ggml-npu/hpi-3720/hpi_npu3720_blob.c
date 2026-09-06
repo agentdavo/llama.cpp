@@ -63,10 +63,10 @@ static int format_present(const char *cache, unsigned version) {
 
 static hpi_status read_weight_input(const char *cache, const char *source_hex,
     const unsigned char source_digest[32], const hpi_q8_0_gemm *op, size_t wbytes,
-    uint8_t **blob, size_t *blob_len, hpi_npu3720_blob_io *io) {
+    uint64_t capacity, uint8_t **blob, size_t *blob_len, hpi_npu3720_blob_io *io) {
     char path[1024];
-    int n = snprintf(path, sizeof path, "%s/v3_%s_n%lld_k%lld_m1.npui", cache, source_hex,
-                     (long long)op->N, (long long)op->K);
+    int n = snprintf(path, sizeof path, "%s/v3_%s_n%lld_k%lld_m%llu.npui", cache, source_hex,
+                     (long long)op->N, (long long)op->K, (unsigned long long)capacity);
     if (n <= 0 || (size_t)n >= sizeof path) return HPI_UNAVAILABLE;
     unsigned char *image = NULL;
     size_t length = 0;
@@ -79,7 +79,7 @@ static hpi_status read_weight_input(const char *cache, const char *source_hex,
     const uint32_t slab = read32(image + 48);
     if (length - 160u != image_bytes || memcmp(image, "NPUC3720", 8) ||
         read32(image + 8) != 3 || read32(image + 12) != 160 || read32(image + 16) != 8 ||
-        read32(image + 20) != 1 || read64(image + 24) != 1 ||
+        read32(image + 20) != 1 || read64(image + 24) != capacity ||
         read64(image + 32) != (uint64_t)op->N || read64(image + 40) != (uint64_t)op->K ||
         !slab || slab % 32 || (uint64_t)op->N % (2ull * slab) || read32(image + 52) != 4 ||
         read64(image + 56) != wbytes || memcmp(image + 64, source_digest, 32)) {
@@ -103,6 +103,7 @@ static hpi_status read_weight_input(const char *cache, const char *source_hex,
     *blob = program; *blob_len = program_bytes;
     io->arg_x = 0; io->arg_w = 1; io->arg_y = 2;
     io->weight_image = image; io->weight_image_bytes = image_bytes;
+    io->capacity = (int64_t)capacity;
     return HPI_OK;
 }
 
@@ -117,7 +118,7 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
     const char *cache = getenv("NPU_BLOB_CACHE");
     if (!cache || !cache[0]) return HPI_UNAVAILABLE;
     const int has_v2 = format_present(cache, 2);
-    const int has_v3 = op->M == 1 && format_present(cache, 3);
+    const int has_v3 = op->M <= 8 && format_present(cache, 3);
     if (!has_v2 && !has_v3) return HPI_UNAVAILABLE;
     const uint64_t row_blocks = (uint64_t)op->K / HPI_QK8_0;
     if (row_blocks > SIZE_MAX / sizeof(hpi_block_q8_0)) return HPI_EINVAL;
@@ -129,9 +130,12 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
     sha256_hash(source_digest, (const unsigned char *)op->w, wbytes);
     char hex[65];
     digest_hex(source_digest, hex);
-    if (has_v3 && read_weight_input(cache, hex, source_digest, op, wbytes, blob, blob_len, io) == HPI_OK)
-        return HPI_OK;
-    if (!has_v2) return HPI_UNAVAILABLE;
+    /* v3: the 1-row program for plain decode when the cache has it, else (and for M in 2..8, e.g. the
+     * MTP verification batch) the 8-row program; the runtime zero-pads unused rows. */
+    if (has_v3 && op->M == 1 &&
+        read_weight_input(cache, hex, source_digest, op, wbytes, 1, blob, blob_len, io) == HPI_OK) return HPI_OK;
+    if (has_v3 && read_weight_input(cache, hex, source_digest, op, wbytes, 8, blob, blob_len, io) == HPI_OK) return HPI_OK;
+    if (!has_v2 || (op->M > 1 && op->M <= 8 && op->K != 1024 && op->K != 2048)) return HPI_UNAVAILABLE;
     char path[1024];
     const int written = snprintf(path, sizeof path, "%s/v2_%s_n%lld_k%lld_m%llu.npub",
         cache, hex, (long long)op->N, (long long)op->K, (unsigned long long)capacity);
@@ -160,6 +164,7 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
     memmove(file, file + NPU_CACHE_HEADER, payload_size);
     *blob = file; *blob_len = payload_size;
     io->arg_x = 0; io->arg_y = 1; io->arg_w = -1;
+    io->capacity = (int64_t)capacity;
     return HPI_OK;
 }
 #endif

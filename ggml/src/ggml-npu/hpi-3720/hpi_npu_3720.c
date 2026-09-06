@@ -112,10 +112,14 @@ typedef struct {
     uint64_t weight_evictions;
 } npu3720_priv;
 
-#define NPU3720_DEFAULT_WEIGHT_CACHE_MIB 512u
+/* Whole-model v3 caches keep every routed weight image resident (3.6 GB for Flash-Next decode); a
+ * 512 MiB budget evicted and re-registered images every token. GGML_NPU_WEIGHT_CACHE_MIB overrides. */
+#define NPU3720_DEFAULT_WEIGHT_CACHE_MIB 8192u
 
+/* Capacity class an op asks the provider for: 1-row decode, 8-row (M in 2..8: MTP verification and small
+ * batches, v3 caches), or the 256-row prefill blob. A 1-row op may also run on an 8-row program. */
 static int64_t shape_capacity(const hpi_q8_0_gemm *op) {
-    return op->M == 1 ? 1 : (op->M <= 256 ? 256 : op->M);
+    return op->M == 1 ? 1 : (op->M <= 8 ? 8 : (op->M <= 256 ? 256 : op->M));
 }
 
 /* ---------------------------------------------------------------------------------------------- *
@@ -150,8 +154,10 @@ static hpi_status npu_open(hpi_device *dev) {
     npu3720_priv *p = (npu3720_priv *)calloc(1, sizeof *p);
     if (!p) return HPI_ENOMEM;
     p->profile = dev->profile.enabled ? &dev->profile : NULL;
+    /* AVX/F16C staging of X/Y is the default where the CPU has F16C (measured 2026-09-06: input
+     * conversion 1.2 -> 0.1 ms/token, output 1.2 -> 0.5); GGML_NPU_SIMD=0 selects the scalar path. */
     const char *simd = getenv("GGML_NPU_SIMD");
-    p->simd = simd && simd[0] && simd[0] != '0' && hpi3720_has_f16c();
+    p->simd = !(simd && simd[0] == '0') && hpi3720_has_f16c();
     unsigned long long cache_mib = NPU3720_DEFAULT_WEIGHT_CACHE_MIB;
     const char *cache_env = getenv("GGML_NPU_WEIGHT_CACHE_MIB");
     if (cache_env && cache_env[0]) {
@@ -169,15 +175,17 @@ static hpi_status npu_open(hpi_device *dev) {
         return HPI_EDEVICE;
     }
 
-    /* One queue, with a host wait after each batch. Non-turbo by default: the turbo clock + a metric
-     * streamer once hard-froze the machine (src/npu.h HAZARD). GGML_NPU_TURBO=1 opts into the turbo
-     * DVFS flag (ze_command_queue_desc_npu_ext_t.turbo) for this queue; never run a Level Zero
-     * metric streamer (npu_dvfs_stream) in the same session when it is set. */
+    /* One queue, with a host wait after each batch. TURBO BY DEFAULT since 2026-09-06: the DVFS flag
+     * (ze_command_queue_desc_npu_ext_t.turbo) makes the clock-bound small decode graphs 2.6-2.9x faster
+     * and cut whole-model DPU wait from 206 to 126 ms/token (re/dive/atomic_npu_run_20260906). HAZARD:
+     * a turbo queue plus an open Level Zero metric streamer once hard-froze the PC (src/npu.h); this
+     * backend never opens one, and nothing else may while it runs. GGML_NPU_TURBO=0 opts out. */
     const char *turbo_env = getenv("GGML_NPU_TURBO");
-    const int turbo = turbo_env && turbo_env[0] && turbo_env[0] != '0';
+    const int turbo = !(turbo_env && turbo_env[0] == '0');
     if (npu_queue_create(&p->d, turbo, 0, &p->q) != 0) { free(p); return HPI_EDEVICE; }
     p->q_ok = 1;
-    if (turbo) fprintf(stderr, "hpi-3720: turbo queue requested (GGML_NPU_TURBO) -- do not open a metric streamer\n");
+    fprintf(stderr, "hpi-3720: queue %s (GGML_NPU_TURBO=0 disables turbo; never open a metric streamer while it runs), %s staging\n",
+            turbo ? "TURBO" : "non-turbo", p->simd ? "F16C" : "scalar");
 
     /* Report the driver-reported identity once: this name/id can only come from the real Windows NPU
      * driver via Level Zero — proof the open path is genuine, not a fake. */
@@ -300,7 +308,7 @@ static hpi_status stage_out_f32(float *dst, ze_graph_argument_precision_t prec,
 /* Build a compiled blob + graph + staged buffers for this shape and register it in the cache.
  * Returns the new entry, or NULL on failure (with *st set). */
 static hpi3720_program *program_get(npu3720_priv *p, uint8_t **blob, size_t bytes,
-    size_t weight_bytes, const hpi_q8_0_gemm *op) {
+    size_t weight_bytes, const hpi_q8_0_gemm *op, int64_t capacity) {
     uint8_t digest[32];
     sha256_hash(digest, *blob, bytes);
     for (int i = 0; i < p->nprograms; ++i) {
@@ -321,9 +329,9 @@ static hpi3720_program *program_get(npu3720_priv *p, uint8_t **blob, size_t byte
     if (g->nargs != 3 || g->arg[0].is_output || g->arg[1].is_output || !g->arg[2].is_output ||
         g->arg[0].precision != ZE_GRAPH_ARGUMENT_PRECISION_FP16 ||
         g->arg[1].precision != ZE_GRAPH_ARGUMENT_PRECISION_UINT8 ||
-        g->arg[2].precision != ZE_GRAPH_ARGUMENT_PRECISION_FP16 || op->M != 1 ||
-        g->arg[0].elems != (size_t)op->K || g->arg[1].bytes != weight_bytes ||
-        g->arg[2].elems != (size_t)op->N) {
+        g->arg[2].precision != ZE_GRAPH_ARGUMENT_PRECISION_FP16 || capacity < op->M ||
+        g->arg[0].elems != (size_t)capacity * (size_t)op->K || g->arg[1].bytes != weight_bytes ||
+        g->arg[2].elems != (size_t)capacity * (size_t)op->N) {
         goto failed;
     }
     memcpy(program->digest, digest, 32);
@@ -345,6 +353,7 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
     tmp.w_key = op->w; tmp.M = shape_capacity(op); tmp.N = op->N; tmp.K = op->K;
     *st = hpi_npu3720_build_blob(op, &tmp.blob, &tmp.blob_len, &tmp.io);
     if (*st != HPI_OK) return NULL;
+    if (tmp.io.capacity > 0) tmp.M = tmp.io.capacity;   /* the program's real row capacity (1, 8 or 256) */
     if (tmp.io.arg_w >= 0) {
         if (!tmp.io.weight_image || !tmp.io.weight_image_bytes ||
             tmp.io.arg_x != 0 || tmp.io.arg_w != 1 || tmp.io.arg_y != 2) goto unavailable;
@@ -353,7 +362,7 @@ static npu3720_shape *shape_build(npu3720_priv *p, const hpi_q8_0_gemm *op, hpi_
             *st = room == 1 ? NPU3720_RETRY_PREPARE : (room == -2 ? HPI_UNAVAILABLE : HPI_EDEVICE);
             goto cleanup;
         }
-        tmp.program = program_get(p, &tmp.blob, tmp.blob_len, tmp.io.weight_image_bytes, op);
+        tmp.program = program_get(p, &tmp.blob, tmp.blob_len, tmp.io.weight_image_bytes, op, tmp.M);
         if (!tmp.program) goto unavailable;
         tmp.weight_mem = npu_mem_alloc(&p->d, NPU_MEM_HOST, 0, tmp.io.weight_image_bytes);
         if (!tmp.weight_mem) goto unavailable;
@@ -407,11 +416,16 @@ cleanup:
 }
 
 static npu3720_shape *shape_find(npu3720_priv *p, const hpi_q8_0_gemm *op) {
-    for (int i = 0; i < NPU3720_WEIGHT_MAX; i++) {
-        npu3720_shape *s = &p->cache[i];
-        if (s->valid && s->w_key == op->w && s->M == shape_capacity(op) && s->N == op->N && s->K == op->K) {
-            s->last_used = ++p->cache_clock;
-            return s;
+    const int64_t cls = shape_capacity(op);
+    /* Exact capacity class first; a 1-row op may then reuse a resident 8-row program (same weights). */
+    for (int pass = 0; pass < (cls == 1 ? 2 : 1); ++pass) {
+        const int64_t want = pass == 0 ? cls : 8;
+        for (int i = 0; i < NPU3720_WEIGHT_MAX; i++) {
+            npu3720_shape *s = &p->cache[i];
+            if (s->valid && s->w_key == op->w && s->M == want && s->N == op->N && s->K == op->K) {
+                s->last_used = ++p->cache_clock;
+                return s;
+            }
         }
     }
     return NULL;

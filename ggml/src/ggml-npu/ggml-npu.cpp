@@ -113,6 +113,7 @@ static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
     if (N % NPU_SLABCH != 0 || K % 32 != 0) return false;
     if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // authoring tool skips it -> so must we
     if (M == 1) return true;                    // decode blob within measured K and CMX limits
+    if (M <= 8 && ggml_backend_npu_cache_generation() == 3) return true;   // v3 8-row program (MTP verify batches)
     if (M <= 256 && (K == 1024 || K == 2048)) return true;   // prefill blob (fits CMX)
     return false;
 }
@@ -393,7 +394,7 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         split_pct = (e && e[0]) ? atoi(e) : 0;
         if (split_pct < 0 || split_pct > 99) split_pct = 0;
     }
-    struct npu_tail { const struct ggml_tensor * src0; const struct ggml_tensor * src1; struct ggml_tensor * dst; int64_t n_npu; };
+    struct npu_tail { struct ggml_tensor * src0; struct ggml_tensor * src1; struct ggml_tensor * dst; int64_t n_npu; };
     npu_tail tails[DPU_BATCH];
     int n_tail = 0;
     int split_budget = 512;                          // tensors we may still create in gctx this call
@@ -402,13 +403,13 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         if (n_tail == 0) return;
         tail_graph->n_nodes = 0;
         for (int t = 0; t < n_tail; ++t) {
-            const struct ggml_tensor * s0 = tails[t].src0;
-            const struct ggml_tensor * s1 = tails[t].src1;
+            struct ggml_tensor * s0 = tails[t].src0;
+            struct ggml_tensor * s1 = tails[t].src1;
             struct ggml_tensor * d = tails[t].dst;
             const int64_t K = s0->ne[0], N = s0->ne[1], n0 = tails[t].n_npu;
-            struct ggml_tensor * w = ggml_view_2d(gctx, (struct ggml_tensor *) s0, K, N - n0, s0->nb[1], (size_t) n0 * s0->nb[1]);
+            struct ggml_tensor * w = ggml_view_2d(gctx, s0, K, N - n0, s0->nb[1], (size_t) n0 * s0->nb[1]);
             w->buffer = s0->buffer;
-            struct ggml_tensor * o = ggml_mul_mat(gctx, w, (struct ggml_tensor *) s1);
+            struct ggml_tensor * o = ggml_mul_mat(gctx, w, s1);
             o->data = (char *) d->data + (size_t) n0 * sizeof(float);   // M == 1: the tail rows are contiguous
             o->buffer = d->buffer;
             o->flags |= GGML_TENSOR_FLAG_COMPUTE;              // ggml-cpu skips nodes without it (ggml-cpu.c graph_compute_thread)

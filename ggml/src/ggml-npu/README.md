@@ -86,6 +86,22 @@ See [`hpi-3720/README.md`](hpi-3720/README.md) for the interface, the build/test
 implementation plan.
 
 
+### Device defaults (measured 2026-09-06 on AtomicChat/Flash-Next decode)
+
+* **Turbo queue** (`ze_command_queue_desc_npu_ext_t.turbo`): ON by default; the small decode graphs are
+  clock-bound and run 2.6-2.9x faster, whole-model DPU wait 206 -> 126 ms/token. `GGML_NPU_TURBO=0`
+  opts out. Never open a Level Zero metric streamer while a turbo queue exists (recorded PC freeze).
+* **F16C staging** of X/Y: ON by default when the CPU has F16C; `GGML_NPU_SIMD=0` selects scalar.
+* **Weight-image budget** for v3 caches: 8 GiB by default (`GGML_NPU_WEIGHT_CACHE_MIB`), enough to keep a
+  whole decode model's Q8_0 images resident; 512 MiB evicted every token.
+* **Cache generation** is read from `NPU_BLOB_CACHE` (`cache-v3.ready`): a v3 cache holds two-tile
+  weight-input programs with pre-swizzled slabs (both DPUs, both DMA engines, DPU CMX reads 2.7x faster
+  than linear slabs) and admits the K=6144 and N=640 shapes a single tile cannot fit. Eligible ops are
+  M=1 (1-row program) and M in 2..8 (8-row program, rows zero-padded): the latter is what makes the
+  MTP verification batch run on the DPU. `re/build_blob_cache.py` writes both by default.
+* `GGML_NPU_SPLIT_PCT` (CPU/NPU row split of large GEMVs) exists and is OFF: measured net negative,
+  the two engines share ~40 GB/s of DDR on the target machine.
+
 ### Optional host overlap and SIMD staging
 
 `GGML_NPU_OVERLAP=1` enables conservative CPU/NPU overlap in whole-layer
@@ -96,11 +112,11 @@ flush. HPI remains synchronous to its caller, and slots are released only after
 completion and output conversion. Unsupported/cache-missing operations still
 use the existing CPU delegation. Default: disabled.
 
-`GGML_NPU_SIMD=1` independently enables runtime-checked AVX/F16C staging on
-GCC-compatible x86 builds. It converts eight FP32/FP16 arguments at a time,
-preserving scalar rounding and NaN bits with scalar tails. Only the conversion
-functions carry ISA target attributes; the generic driver and portable reference
-retain their original build target. Default: disabled. No weight format changes.
+`GGML_NPU_SIMD` selects the runtime-checked AVX/F16C staging on GCC-compatible
+x86 builds (default ON where F16C is present; `=0` for scalar). It converts eight
+FP32/FP16 arguments at a time, preserving scalar rounding and NaN bits with scalar
+tails. Only the conversion functions carry ISA target attributes; the generic driver
+and portable reference retain their original build target. No weight format changes.
 
 With `GGML_NPU_PROFILE=1`, `host_work_calls` counts callbacks actually run between
 submission and wait, and `host_work_ms` records their CPU duration. That duration

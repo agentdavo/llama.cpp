@@ -12,6 +12,7 @@ typedef struct {
     int arg_w;   /* weights input index, or < 0 if weights are baked into the blob */
     uint8_t *weight_image;       /* optional malloc-owned immutable image; caller frees */
     size_t weight_image_bytes;
+    int64_t capacity;            /* rows the program computes per run: 1, 8 (v3 M<=8) or 256 (v2 prefill) */
 } hpi_npu3720_blob_io;
 
 /* Produce (or fetch from a cache) a native VPU-3720 blob computing Y[MxN] = X[MxK] . dequant(W)^T for
