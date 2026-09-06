@@ -1,14 +1,9 @@
 /*
  * ggml-npu.cpp — ggml backend for the Intel NPU 2.7 / VPU 3720.
  *
- * Structure follows ggml-blas: a minimal ACCEL device that uses host (CPU) memory and offloads a
- * single op — Q8_0 mul_mat — computing everything else on the CPU backend. The offloaded op is run
- * through the hpi-3720 Host-Platform Interface (hpi-3720/hpi.h). Today that resolves to the CPU
- * reference backend (the "fake" NPU), so results are correct; when the real VPU-3720 path is wired
- * in hpi_npu_3720.c, the same call site dispatches to silicon with no change here.
- *
- * Enough to make llama enumerate the NPU as a device (ggml_backend_dev_*), select it, and offload
- * Q8_0 weight matmuls to it (so -ngl / -ncmoe device placement has an NPU target).
+ * Whole-layer scheduling with a host-memory DPU path for eligible cached Q8_0 matrix products.
+ * The internal ggml CPU backend computes unsupported operations. Hardware-enabled builds use
+ * the hpi-3720 Level Zero runtime; portable builds retain the HPI CPU reference for testing.
  */
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -26,7 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-static bool ggml_backend_npu_gpu_offload(void);   // NPU_OFFLOAD_GPU: whole-layer GPU offload vs default ACCEL
+static bool ggml_backend_npu_gpu_offload(void);   // NPU_OFFLOAD_GPU=0 selects legacy ACCEL scheduling
 
 // Direct-to-stderr trace, independent of the ggml log callback (tools like llama-bench install a
 // callback that drops info logs). Enabled by GGML_NPU_VERBOSE=1 so a run can be *shown* to compute.
@@ -725,7 +720,7 @@ ggml_backend_t ggml_backend_npu_init(void) {
             NPU_TRACE("internal CPU backend: %d threads\n", nth);
         }
         if (!ctx->cpu) {
-            GGML_LOG_ERROR("%s: NPU_OFFLOAD_GPU set but ggml_backend_cpu_init() failed\n", __func__);
+            GGML_LOG_ERROR("%s: internal CPU backend initialization failed\n", __func__);
             hpi_close(ctx->hpi); delete ctx; return NULL;
         }
 #if defined(GGML_NPU_XE_LPG)
@@ -758,17 +753,15 @@ bool ggml_backend_is_npu(ggml_backend_t backend) {
 // SOLVED: get_host_buffer_type below hands the KV cache back to the CPU, and graph_compute delegates
 // every non-DPU node to the internal CPU backend — the ggml-hexagon two-buft split.
 //
-// GPU-passthrough is THE DIRECTION, not an experiment: every silicon measurement in re/FINDINGS.md
-// (incl. the batched/unbatched A/B at :1635) was taken with NPU_OFFLOAD_GPU=1. The env var default
-// stays 0 only so an unset run cannot surprise anyone with the no-mmap cost below — do NOT read that
-// default as ACCEL being the plan.
+// Whole-layer scheduling is the measured default. NPU_OFFLOAD_GPU=0 keeps the legacy ACCEL path
+// available for diagnosis. Unsupported operations run on the internal CPU backend.
 //
 // COST, and it is sharp: the device buft is is_host=false ON PURPOSE (that is what makes the sched
 // route ops to us), so llama does NOT mmap weights placed here — it commits them to RAM. On a large
-// model -ngl 999 without -ncmoe will try to commit the whole file. See scripts/run.sh.
+// model -ngl 999 without -ncmoe will try to commit the whole file. run.py keeps routed experts on CPU.
 static bool ggml_backend_npu_gpu_offload(void) {
     static int v = -1;
-    if (v < 0) { const char * e = getenv("NPU_OFFLOAD_GPU"); v = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    if (v < 0) { const char * e = getenv("NPU_OFFLOAD_GPU"); v = !(e && e[0] == '0'); }
     return v == 1;
 }
 
@@ -780,7 +773,7 @@ static const char * ggml_backend_npu_device_get_name(ggml_backend_dev_t dev) {
 }
 
 static const char * ggml_backend_npu_device_get_description(ggml_backend_dev_t dev) {
-    return "Intel NPU 2.7 / VPU 3720 (hpi-3720; CPU reference until silicon path lands)";
+    return "Intel NPU 2.7 / VPU 3720 (hpi-3720)";
     GGML_UNUSED(dev);
 }
 
@@ -795,7 +788,7 @@ static void ggml_backend_npu_device_get_memory(ggml_backend_dev_t dev, size_t * 
 }
 
 static enum ggml_backend_dev_type ggml_backend_npu_device_get_type(ggml_backend_dev_t dev) {
-    // GPU (opt-in) puts whole layers on the NPU via -ngl (ggml-hexagon pattern); ACCEL (default) is
+    // GPU (default) puts whole layers on the NPU via -ngl (ggml-hexagon pattern); ACCEL (opt-out) is
     // op-fallback only. See ggml_backend_npu_gpu_offload above.
     return ggml_backend_npu_gpu_offload() ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_ACCEL;
     GGML_UNUSED(dev);

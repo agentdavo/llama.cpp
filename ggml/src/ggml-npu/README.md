@@ -1,11 +1,53 @@
 # ggml-npu — Intel NPU 2.7 / VPU 3720 backend (work in progress)
 
+## Normal launch on the measured Arrow Lake host
+
+From the llama.cpp directory:
+
+```powershell
+python ggml/src/ggml-npu/run.py
+python ggml/src/ggml-npu/run.py atomic
+```
+
+The default is Unsloth Flash-Next UD-Q4_K_XL on NPU with MTP 5. Atomic uses CPU
+with MTP 3 because it won the paired coding measurements. `atomic --backend npu`
+selects its NPU comparison. Both presets use four CPU threads, batch and microbatch
+128, a CPU draft head, and CPU routed experts. Models are read directly from the
+existing Hugging Face snapshots; the launcher checks every shard and the shared head.
+The server listens on localhost:8080 with a 2048-token context and thinking disabled.
+
+The launcher uses `build-npu-defaults/bin/llama-server.exe`; build from the parent NPU
+workspace with `./src/build_llama.ps1 -Toolchain ucrt64 -BuildDir ./llama.cpp/build-npu-defaults`.
+`--server` selects another hardware-enabled build, `--port` changes the port, and
+`--print-only` displays the complete command without loading weights.
+
+Whole-layer scheduling is now the backend default, including ordinary llama.cpp
+invocations. Four internal CPU threads, turbo queues, F16C staging when supported,
+an 8 GiB resident weight cache, and registered buffer/command-list reuse are also
+defaults. Qwen4exp small F32 matrix reductions use the measured F32-dot policy.
+No tuning environment variables are needed for these settings. `NPU_BLOB_CACHE`
+still identifies external compiled weights/programs; the launcher chooses the
+model's existing cache automatically. Direct invocations must supply a suitable cache
+and keep routed experts on CPU (`-ncmoe 48` for these models) to avoid committing the
+whole expert store to NPU host buffers.
+
+Diagnostic overrides remain available: `NPU_OFFLOAD_GPU=0` selects legacy ACCEL
+scheduling and `LLAMA_QWEN4EXP_F32_DOT=0` disables the small-batch F32 policy.
+CPU/DPU overlap, early QKVZ scheduling and experimental expert dispatch remain off.
+Low-bit expert SHAVE unpacking is not yet a production default; unsupported operations
+stay on CPU. Never run a Level Zero metric streamer alongside the turbo queue.
+
+These are coding presets selected from the 2026-09-06 matrix in the parent workspace,
+`re/dive/perf_matrix_20260906/README.md`. CPU/NPU output identity remains unresolved.
+Those performance measurements predate the host-allocation alignment fix; rebuilding
+does not establish a new throughput result.
+
 A ggml backend for the Intel NPU ("AI Boost", NPU 2.7 / VPU 37xx, PCI `8086:AD1D`) that talks to
 the device **directly** — no OpenVINO runtime — reusing the direct-access toolkit developed in the
 [`agentdavo/npu`](https://github.com/agentdavo/npu) project (`src/npu.h`: Level Zero → JSM/DMA →
 the NCE/DPU MAC array).
 
-Structurally this mirrors `ggml-hexagon`: a host-side backend (`ggml-npu.cpp`, *not yet added*) plus
+Structurally this mirrors `ggml-hexagon`: a host-side backend (`ggml-npu.cpp`) plus
 a device/interface layer. Here that layer is [`hpi-3720/`](hpi-3720/) — the **Host-Platform Interface
 for VPU 3720**, the seam through which the host offloads compute to the accelerator.
 
@@ -15,8 +57,8 @@ for VPU 3720**, the seam through which the host offloads compute to the accelera
 |-------|-------|
 | `hpi-3720/` HPI + Q8_0 GEMM contract | **done** — API + portable CPU reference, self-tested |
 | `hpi-3720/` GGUF reader + offload harness | **done** — reads Q8_0 tensors from a `.gguf`, runs them through the offload |
-| `ggml-npu.cpp` host backend glue | **done** — registers via `ggml_add_backend(NPU)`; llama enumerates it as an `ACCEL` device |
-| `hpi-3720/` NPU-3720 hardware path | **stub** — waits on the NCE descriptor / Q8_0 schedule (see outer CLAUDE.md "long game") |
+| `ggml-npu.cpp` host backend glue | **done** — registers via `ggml_add_backend(NPU)`; llama enumerates it as a GPU-class device for whole-layer scheduling |
+| `hpi-3720/` NPU-3720 hardware path | **implemented for eligible cached Q8_0 matrices** — Level Zero DPU programs with CPU fallback |
 
 First target op is **Q8_0 offload** (a mul_mat whose weight operand is Q8_0-quantized), because Q8_0
 is a clean, well-understood block format and a natural fit for the NPU's INT8 MAC array.
@@ -29,24 +71,14 @@ cmake --build build --target test-backend-ops -j
 ./build/bin/test-backend-ops test -b NPU -o MUL_MAT
 ```
 
-`test-backend-ops` enumerates every registered backend (so it confirms the NPU device is detected)
-and runs the op suite against it. The NPU backend declines every op except Q8_0 `mul_mat`, and passes
-all Q8_0 `mul_mat` cases — batched and GQA-broadcast included — against ggml's own reference. Since
-the compute runs on the hpi CPU reference, results are correct today; a `-DGGML_NPU_HW=ON` build will
-route them to silicon with no change to this backend.
+This command builds the portable CPU-reference configuration. For real device execution use
+`-DGGML_NPU_HW=ON` with the NPU toolkit headers, or the PowerShell build above.
+Hardware dispatch requires a compatible compiled blob cache and eligible matrix geometry;
+unsupported operations run on the internal ggml CPU backend.
 
-The device shows up as an `ACCEL` named `hpi-3720` (reg family `NPU`, mirroring Hexagon's
-`HTP`/`HTP0` split), so it is selectable and an offload target:
-
-```sh
-llama-cli --list-devices                 # -> hpi-3720: Intel NPU 2.7 / VPU 3720 (...)
-llama-cli --device hpi-3720 -ngl 999 -m model-q8_0.gguf -p "..."
-```
-
-`--device` matches the name case-insensitively. Q8_0 weight matmuls the device accepts get
-offloaded; everything else falls back to CPU. (`-ncmoe`/`-cmoe` pin MoE experts to CPU, so keep
-them low/unset if you want expert matmuls to reach `hpi-3720`.) Note this is still the CPU
-reference — selecting it is correctness/plumbing, not speed, until the silicon path lands.
+The device is named `hpi-3720` (registration family `NPU`) and uses GPU-class
+whole-layer placement by default. `--device hpi-3720` selects it. Keep routed
+experts on CPU with `-ncmoe`/`-cmoe`; experimental expert dispatch is disabled.
 
 ### Prove it computes (no download)
 

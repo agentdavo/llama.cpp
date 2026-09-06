@@ -516,9 +516,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_build_forward_expand(gf, cur);
 
-    // Set before context creation. This CPU-only experiment keeps small target batches on the same F32 reduction path.
+    // Keep small target batches on the measured F32 reduction path. Set the environment override to 0 to opt out.
     const char * f32_dot = std::getenv("LLAMA_QWEN4EXP_F32_DOT");
-    if (f32_dot && std::string(f32_dot) == "1" && n_tokens <= 4) {
+    if (!(f32_dot && f32_dot[0] == '0') && n_tokens <= 4) {
         int marked = 0;
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor * node = ggml_graph_node(gf, i);
