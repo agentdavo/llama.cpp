@@ -90,7 +90,8 @@ static size_t ggml_backend_npu_cmx_need(int64_t K, int64_t N) {
     const bool two_tile = ggml_backend_npu_cache_generation() == 3;
     const size_t slabch = two_tile && K > 1024 ? 128u : (size_t) NPU_SLABCH;
     const size_t n_tile = two_tile ? (size_t) N / 2u : (size_t) N;
-    const size_t SB = slabch * 16u + slabch * (size_t) K;
+    const size_t wbytes = two_tile && K <= 1024 ? 2u : 1u;     // v3 authors K<=1024 as exact FP16 weights
+    const size_t SB = slabch * 16u + slabch * (size_t) K * wbytes;
     const size_t out = ((size_t) K * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
     const size_t s0 = (out + n_tile * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
     const size_t s1 = (s0 + SB + 0xFFFu) & ~(size_t) 0xFFFu;
@@ -112,6 +113,14 @@ static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
     if (K <= 0 || K > NPU_M1_K_MAX || N <= 0 || N > NPU_CMX_BUDGET / 2 || M <= 0) return false;
     if (N % NPU_SLABCH != 0 || K % 32 != 0) return false;
     if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // authoring tool skips it -> so must we
+    {   // Diagnostic placement knobs: keep ops outside [GGML_NPU_MIN_K, GGML_NPU_MAX_K] on the CPU (numerics A/B).
+        static int64_t min_k = -1, max_k = -1;
+        if (min_k < 0) {
+            const char * lo = getenv("GGML_NPU_MIN_K"); const char * hi = getenv("GGML_NPU_MAX_K");
+            min_k = (lo && lo[0]) ? atoll(lo) : 0; max_k = (hi && hi[0]) ? atoll(hi) : INT64_MAX;
+        }
+        if (K < min_k || K > max_k) return false;
+    }
     if (M == 1) return true;                    // decode blob within measured K and CMX limits
     if (M <= 8 && ggml_backend_npu_cache_generation() == 3) return true;   // v3 8-row program (MTP verify batches)
     if (M <= 256 && (K == 1024 || K == 2048)) return true;   // prefill blob (fits CMX)

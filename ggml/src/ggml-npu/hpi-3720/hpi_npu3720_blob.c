@@ -72,14 +72,18 @@ static hpi_status read_weight_input(const char *cache, const char *source_hex,
     size_t length = 0;
     if (read_file(path, &image, &length)) return HPI_UNAVAILABLE;
     if (length < 160 || op->K > 8192 ||
-        (uint64_t)op->N > (SIZE_MAX - 160u) / ((uint64_t)op->K + 16u)) {
+        (uint64_t)op->N > (SIZE_MAX - 160u) / (2u * (uint64_t)op->K + 16u)) {
         free(image); return HPI_UNAVAILABLE;
     }
-    const size_t image_bytes = (size_t)op->N * ((size_t)op->K + 16u);
+    /* weight kind (offset 20): 1 = row-scaled I8 rows (K bytes + 16-byte table entry per channel),
+     * 2 = exact FP16 rows (2K bytes + 16) -- used for small-K tensors whose per-row requant hurt numerics. */
+    const uint32_t kind = read32(image + 20);
+    const size_t wrow = kind == 2 ? 2u * (size_t)op->K : (size_t)op->K;
+    const size_t image_bytes = (size_t)op->N * (wrow + 16u);
     const uint32_t slab = read32(image + 48);
     if (length - 160u != image_bytes || memcmp(image, "NPUC3720", 8) ||
         read32(image + 8) != 3 || read32(image + 12) != 160 || read32(image + 16) != 8 ||
-        read32(image + 20) != 1 || read64(image + 24) != capacity ||
+        (kind != 1 && kind != 2) || read64(image + 24) != capacity ||
         read64(image + 32) != (uint64_t)op->N || read64(image + 40) != (uint64_t)op->K ||
         !slab || slab % 32 || (uint64_t)op->N % (2ull * slab) || read32(image + 52) != 4 ||
         read64(image + 56) != wbytes || memcmp(image + 64, source_digest, 32)) {
