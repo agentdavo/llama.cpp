@@ -555,6 +555,9 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
         }
 #endif
 
+        // Views have no work to execute. Consumers still check the aliased storage.
+        if (ggml_npu_metadata_op(node->op)) continue;
+
         const bool batchable = ggml_backend_npu_dpu_cacheable(node) && node->ne[2] == 1 && node->ne[3] == 1;
         if (trace_nodes && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
             const struct ggml_tensor * s0 = node->src[0];

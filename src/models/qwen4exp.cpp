@@ -1152,6 +1152,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    const char * early_qkvz = std::getenv("LLAMA_QWEN4EXP_EARLY_QKVZ");
+    if (early_qkvz && std::strcmp(early_qkvz, "1") == 0) {
+        // Both projections read cur; schedule them before their CPU consumers.
+        ggml_build_forward_expand(gf, z);
+        ggml_build_forward_expand(gf, qkv_mixed);
+    }
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
