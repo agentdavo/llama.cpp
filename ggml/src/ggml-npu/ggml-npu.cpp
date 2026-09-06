@@ -39,6 +39,8 @@ struct ggml_backend_npu_context {
     uint64_t     n_flop    = 0;   // 2*M*N*K summed, for the free-time summary
     uint64_t     n_m_gt1   = 0;   // ops with M>1 (prefill-shaped)
     uint64_t     n_cpu_pass = 0;  // nodes passed through to the internal CPU backend
+    uint64_t     n_split_tail = 0; // CPU row-split tails computed (GGML_NPU_SPLIT_PCT)
+    bool         split_reported = false;
     int64_t      max_m     = 0;   // largest M seen (diagnose prefill batching)
     bool         logged_first = false;
     uint64_t     profile_graphs = 0;
@@ -362,7 +364,8 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     // possible failure mode for a bound we believe is correct.
     const int batch_cap = cgraph->n_nodes > 0 ? cgraph->n_nodes : 1;
     struct ggml_init_params ip = {
-        /* .mem_size   = */ ggml_graph_overhead_custom(batch_cap, false) + ggml_tensor_overhead(),
+        /* .mem_size   = */ ggml_graph_overhead_custom(batch_cap, false) + ggml_tensor_overhead()
+                            + ggml_graph_overhead_custom(32, false) + 2u * 512u * ggml_tensor_overhead(),
         /* .mem_buffer = */ NULL,
         /* .no_alloc   = */ true,
     };
@@ -377,6 +380,46 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     hpi_q8_0_gemm        dpu_ops[DPU_BATCH];
     struct ggml_tensor * dpu_dst[DPU_BATCH];
     int n_dpu = 0;
+
+    // CPU/NPU ROW SPLIT (GGML_NPU_SPLIT_PCT=p, default off). At M=1 every DPU op is a weight stream and
+    // the CPU idles in sync_ms; both engines are DDR-bound on the same DIMMs at ~30-36 GB/s each while
+    // the DIMMs give ~70. So for a large decode GEMV the NPU takes rows [0, n_npu) -- a v3 cache entry
+    // authored for exactly those rows (its digest is the digest of those bytes, so the provider needs
+    // no change) -- and the CPU computes rows [n_npu, N) into the same dst inside the overlap callback
+    // while the NPU streams. n_npu = floor(N*p/100 / 512) * 512 must match re/build_blob_cache.py.
+    static int split_pct = -1;
+    if (split_pct < 0) {
+        const char * e = getenv("GGML_NPU_SPLIT_PCT");
+        split_pct = (e && e[0]) ? atoi(e) : 0;
+        if (split_pct < 0 || split_pct > 99) split_pct = 0;
+    }
+    struct npu_tail { const struct ggml_tensor * src0; const struct ggml_tensor * src1; struct ggml_tensor * dst; int64_t n_npu; };
+    npu_tail tails[DPU_BATCH];
+    int n_tail = 0;
+    int split_budget = 512;                          // tensors we may still create in gctx this call
+    struct ggml_cgraph * tail_graph = split_pct ? ggml_new_graph_custom(gctx, 32, false) : NULL;
+    auto run_tails = [&]() {
+        if (n_tail == 0) return;
+        tail_graph->n_nodes = 0;
+        for (int t = 0; t < n_tail; ++t) {
+            const struct ggml_tensor * s0 = tails[t].src0;
+            const struct ggml_tensor * s1 = tails[t].src1;
+            struct ggml_tensor * d = tails[t].dst;
+            const int64_t K = s0->ne[0], N = s0->ne[1], n0 = tails[t].n_npu;
+            struct ggml_tensor * w = ggml_view_2d(gctx, (struct ggml_tensor *) s0, K, N - n0, s0->nb[1], (size_t) n0 * s0->nb[1]);
+            w->buffer = s0->buffer;
+            struct ggml_tensor * o = ggml_mul_mat(gctx, w, (struct ggml_tensor *) s1);
+            o->data = (char *) d->data + (size_t) n0 * sizeof(float);   // M == 1: the tail rows are contiguous
+            o->buffer = d->buffer;
+            o->flags |= GGML_TENSOR_FLAG_COMPUTE;              // ggml-cpu skips nodes without it (ggml-cpu.c graph_compute_thread)
+            tail_graph->nodes[tail_graph->n_nodes++] = o;
+        }
+        const int64_t t0 = before.enabled ? ggml_time_us() : 0;
+        GGML_ASSERT(ggml_backend_graph_compute(ctx->cpu, tail_graph) == GGML_STATUS_SUCCESS);
+        if (before.enabled) cpu_ms += (double)(ggml_time_us() - t0) / 1000.0;
+        ctx->n_split_tail += (uint64_t) n_tail;
+        n_tail = 0;
+    };
 
     auto flush_cpu = [&]() {
         if (batch->n_nodes > 0) {
@@ -402,7 +445,11 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 fflush(stderr);
             }
             hpi_status results[DPU_BATCH];
-            if (overlap && batch->n_nodes > 0) {
+            if (n_tail > 0) {
+                auto work = [](void *user) { (*static_cast<decltype(run_tails) *>(user))(); };
+                GGML_ASSERT(hpi_q8_0_gemm_batch_overlap(ctx->hpi, dpu_ops, n_dpu, results,
+                            work, &run_tails) == HPI_OK);
+            } else if (overlap && batch->n_nodes > 0) {
                 auto work = [](void *user) { (*static_cast<decltype(flush_cpu) *>(user))(); };
                 GGML_ASSERT(hpi_q8_0_gemm_batch_overlap(ctx->hpi, dpu_ops, n_dpu, results,
                             work, &flush_cpu) == HPI_OK);
@@ -528,6 +575,17 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 (const float *)          node->src[1]->data,
                 (float *)                node->data,
             };
+            {
+                const int64_t N = node->src[0]->ne[1], K = node->src[0]->ne[0], M = node->ne[1];
+                if (split_pct && M == 1 && K > 1024 && N >= 4096 && split_budget >= 2) {
+                    const int64_t n_npu = ((N * split_pct / 100) / 512) * 512;
+                    if (n_npu >= 512 && n_npu < N) {
+                        dpu_ops[n_dpu].N = n_npu;
+                        tails[n_tail++] = npu_tail{ node->src[0], node->src[1], node, n_npu };
+                        split_budget -= 2;
+                    }
+                }
+            }
             dpu_dst[n_dpu] = node;
             n_dpu++;
         } else {
@@ -561,6 +619,11 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
     flush_cpu();
     ggml_free(gctx);
     report_profile();
+    if (split_pct && !ctx->split_reported && ctx->n_split_tail) {
+        ctx->split_reported = true;
+        fprintf(stderr, "hpi-3720: CPU/NPU row split active (GGML_NPU_SPLIT_PCT=%d): %llu CPU tails so far\n",
+                split_pct, (unsigned long long) ctx->n_split_tail);
+    }
 #if defined(GGML_NPU_XE_LPG)
     ggml_backend_npu_xe_lpg_report_graph(ctx->xe_lpg);
 #endif
