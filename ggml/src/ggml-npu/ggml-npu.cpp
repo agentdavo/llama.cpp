@@ -63,10 +63,34 @@ struct ggml_backend_npu_context {
 #define NPU_CMX_BUDGET (1900u * 1024u)     // build_blob_cache.py CMX_BUDGET
 #define NPU_M1_K_MAX   8192                // measured unsliced limit; failure at 8208 is still unexplained
 
+// Which cache generation NPU_BLOB_CACHE holds, detected once from its ready marker. v2 = one baked
+// single-tile graph per weight (SLABCH 256 on one tile); v3 = shape-only two-tile programs with the
+// weight image as a graph input: each tile streams N/2 channels in 128-channel slabs (256 when K<=1024,
+// see re/build_blob_cache.py), so the CMX need is computed per tile. Only the geometry differs here;
+// hpi_npu3720_blob.c still validates every entry on lookup and declines what the cache lacks.
+static int ggml_backend_npu_cache_generation(void) {
+    static int generation = 0;
+    if (generation) return generation;
+    generation = 2;
+    const char *cache = getenv("NPU_BLOB_CACHE");
+    if (cache && cache[0]) {
+        char path[1024];
+        const int n = snprintf(path, sizeof path, "%s/cache-v3.ready", cache);
+        if (n > 0 && (size_t) n < sizeof path) {
+            FILE *f = fopen(path, "rb");
+            if (f) { generation = 3; fclose(f); }
+        }
+    }
+    return generation;
+}
+
 static size_t ggml_backend_npu_cmx_need(int64_t K, int64_t N) {
-    const size_t SB = (size_t) NPU_SLABCH * 16u + (size_t) NPU_SLABCH * (size_t) K;
+    const bool two_tile = ggml_backend_npu_cache_generation() == 3;
+    const size_t slabch = two_tile && K > 1024 ? 128u : (size_t) NPU_SLABCH;
+    const size_t n_tile = two_tile ? (size_t) N / 2u : (size_t) N;
+    const size_t SB = slabch * 16u + slabch * (size_t) K;
     const size_t out = ((size_t) K * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
-    const size_t s0 = (out + (size_t) N * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
+    const size_t s0 = (out + n_tile * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
     const size_t s1 = (s0 + SB + 0xFFFu) & ~(size_t) 0xFFFu;
     return s1 + SB;
 }

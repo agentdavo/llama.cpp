@@ -169,11 +169,15 @@ static hpi_status npu_open(hpi_device *dev) {
         return HPI_EDEVICE;
     }
 
-    /* One non-turbo queue, with a host wait after each batch. Non-turbo on purpose: the turbo
-     * clock + a metric streamer once hard-froze the machine (src/npu.h HAZARD); leave turbo to an
-     * explicit, coordinated benchmark, not the default compute path. */
-    if (npu_queue_create(&p->d, 0, 0, &p->q) != 0) { free(p); return HPI_EDEVICE; }
+    /* One queue, with a host wait after each batch. Non-turbo by default: the turbo clock + a metric
+     * streamer once hard-froze the machine (src/npu.h HAZARD). GGML_NPU_TURBO=1 opts into the turbo
+     * DVFS flag (ze_command_queue_desc_npu_ext_t.turbo) for this queue; never run a Level Zero
+     * metric streamer (npu_dvfs_stream) in the same session when it is set. */
+    const char *turbo_env = getenv("GGML_NPU_TURBO");
+    const int turbo = turbo_env && turbo_env[0] && turbo_env[0] != '0';
+    if (npu_queue_create(&p->d, turbo, 0, &p->q) != 0) { free(p); return HPI_EDEVICE; }
     p->q_ok = 1;
+    if (turbo) fprintf(stderr, "hpi-3720: turbo queue requested (GGML_NPU_TURBO) -- do not open a metric streamer\n");
 
     /* Report the driver-reported identity once: this name/id can only come from the real Windows NPU
      * driver via Level Zero — proof the open path is genuine, not a fake. */
