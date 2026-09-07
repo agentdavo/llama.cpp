@@ -98,6 +98,8 @@ typedef struct {
 static_assert(sizeof(hpi_block_q8_0) == sizeof(uint16_t) + HPI_QK8_0, "hpi_block_q8_0 must be 34 bytes, matching ggml block_q8_0");
 
 #define HPI_QK4_K        256   /* elements per Q4_K superblock — ggml QK_K */
+#define HPI_QK5_1        32    /* elements per Q5_1 block -- ggml QK5_1 */
+#define HPI_Q5_1_BYTES   24    /* bytes per Q5_1 block: d, m, qh[4], qs[16] */
 #define HPI_Q4_K_BYTES   144   /* bytes per Q4_K superblock — sizeof(ggml block_q4_K) */
 
 /*
@@ -114,7 +116,8 @@ static_assert(sizeof(hpi_block_q8_0) == sizeof(uint16_t) + HPI_QK8_0, "hpi_block
  */
 typedef enum {
     HPI_W_Q8_0 = 0,
-    HPI_W_Q4_K = 1
+    HPI_W_Q4_K = 1,
+    HPI_W_Q5_1 = 2
 } hpi_weight_type;
 
 /* Bytes in one packed row of K elements, or 0 if K is not block-aligned for the
@@ -124,6 +127,7 @@ static inline int64_t hpi_weight_row_bytes(hpi_weight_type type, int64_t k) {
     switch (type) {
         case HPI_W_Q8_0: return (k % HPI_QK8_0) ? 0 : (k / HPI_QK8_0) * (int64_t)sizeof(hpi_block_q8_0);
         case HPI_W_Q4_K: return (k % HPI_QK4_K) ? 0 : (k / HPI_QK4_K) * HPI_Q4_K_BYTES;
+        case HPI_W_Q5_1: return (k % HPI_QK5_1) ? 0 : (k / HPI_QK5_1) * HPI_Q5_1_BYTES;
         default:         return 0;
     }
 }

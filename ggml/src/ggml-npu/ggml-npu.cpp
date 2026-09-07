@@ -137,6 +137,16 @@ static bool ggml_backend_npu_source_type_ok(enum ggml_type t, hpi_weight_type * 
         if (out) *out = HPI_W_Q4_K;
         return true;
     }
+    // Q5_1 is separate from Q4_K because this checkpoint is mixed precision
+    // PER LAYER: some layers' ffn_down_exps are Q5_1 while their siblings are
+    // Q4_K, so the two are independent decisions rather than one switch.
+    if (t == GGML_TYPE_Q5_1) {
+        static int q51 = -1;
+        if (q51 < 0) { const char * e = getenv("GGML_NPU_Q5_1"); q51 = (e && e[0] && e[0] != '0') ? 1 : 0; }
+        if (!q51) return false;
+        if (out) *out = HPI_W_Q5_1;
+        return true;
+    }
     return false;
 }
 
