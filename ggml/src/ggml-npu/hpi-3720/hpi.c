@@ -13,6 +13,11 @@ static void       cpu_close(hpi_device *dev) { (void)dev; }
 
 static hpi_status cpu_gemm(hpi_device *dev, const hpi_q8_0_gemm *op) {
     (void)dev;
+    /* This reference dequantizes Q8_0 blocks directly out of op->w. Any other
+     * source type is a different byte layout, so reinterpreting it here would
+     * produce silently wrong numbers rather than an error. Refuse instead: the
+     * caller falls back to ggml-cpu, which is both correct and faster. */
+    if (op->wtype != HPI_W_Q8_0) return HPI_EINVAL;
     const int64_t M = op->M, N = op->N, K = op->K;
     const int64_t kb = K / HPI_QK8_0;             /* blocks per row */
 
@@ -110,7 +115,7 @@ hpi_status hpi_q8_0_gemm_run(hpi_device *dev, const hpi_q8_0_gemm *op) {
     if (!dev || !dev->ops || !dev->ops->gemm || !op) return HPI_EINVAL;
     if (!op->w || !op->x || !op->y)                  return HPI_EINVAL;
     if (op->M <= 0 || op->N <= 0 || op->K <= 0)      return HPI_EINVAL;
-    if (op->K % HPI_QK8_0 != 0)                      return HPI_EINVAL;
+    if (!hpi_weight_row_bytes(op->wtype, op->K))     return HPI_EINVAL;
     return dev->ops->gemm(dev, op);
 }
 
@@ -120,7 +125,7 @@ hpi_status hpi_q8_0_gemm_batch(hpi_device *dev, const hpi_q8_0_gemm *ops, int n)
         const hpi_q8_0_gemm *op = &ops[i];
         if (!op->w || !op->x || !op->y)             return HPI_EINVAL;
         if (op->M <= 0 || op->N <= 0 || op->K <= 0) return HPI_EINVAL;
-        if (op->K % HPI_QK8_0 != 0)                 return HPI_EINVAL;
+        if (!hpi_weight_row_bytes(op->wtype, op->K)) return HPI_EINVAL;
     }
     if (dev->ops->gemm_batch) return dev->ops->gemm_batch(dev, ops, n);
     if (!dev->ops->gemm)      return HPI_EINVAL;

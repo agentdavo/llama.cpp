@@ -116,17 +116,18 @@ hpi_status hpi_npu3720_build_blob(const hpi_q8_0_gemm *op,
     if (!blob || !blob_len || !io) return HPI_EINVAL;
     *blob = NULL; *blob_len = 0;
     memset(io, 0, sizeof *io);
-    if (!op || !op->w || op->M <= 0 || op->N <= 0 || op->K <= 0 ||
-        op->K % HPI_QK8_0) return HPI_EINVAL;
+    if (!op || !op->w || op->M <= 0 || op->N <= 0 || op->K <= 0) return HPI_EINVAL;
+    /* Row size follows the SOURCE type; the cached image is per-channel i8 or
+     * FP16 either way, so only the digest and byte count are type-dependent. */
+    const int64_t type_row_bytes = hpi_weight_row_bytes(op->wtype, op->K);
+    if (!type_row_bytes) return HPI_EINVAL;
     if (op->M > 256) return HPI_UNAVAILABLE;
     const char *cache = getenv("NPU_BLOB_CACHE");
     if (!cache || !cache[0]) return HPI_UNAVAILABLE;
     const int has_v2 = format_present(cache, 2);
     const int has_v3 = op->M <= 8 && format_present(cache, 3);
     if (!has_v2 && !has_v3) return HPI_UNAVAILABLE;
-    const uint64_t row_blocks = (uint64_t)op->K / HPI_QK8_0;
-    if (row_blocks > SIZE_MAX / sizeof(hpi_block_q8_0)) return HPI_EINVAL;
-    const size_t row_bytes = (size_t)row_blocks * sizeof(hpi_block_q8_0);
+    const size_t row_bytes = (size_t)type_row_bytes;
     if ((uint64_t)op->N > SIZE_MAX / row_bytes) return HPI_EINVAL;
     const size_t wbytes = (size_t)op->N * row_bytes;
     const uint64_t capacity = op->M == 1 ? 1u : 256u;

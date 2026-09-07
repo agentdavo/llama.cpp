@@ -97,6 +97,37 @@ typedef struct {
 /* ABI guard: the whole point of mirroring ggml is that this stays true. */
 static_assert(sizeof(hpi_block_q8_0) == sizeof(uint16_t) + HPI_QK8_0, "hpi_block_q8_0 must be 34 bytes, matching ggml block_q8_0");
 
+#define HPI_QK4_K        256   /* elements per Q4_K superblock — ggml QK_K */
+#define HPI_Q4_K_BYTES   144   /* bytes per Q4_K superblock — sizeof(ggml block_q4_K) */
+
+/*
+ * The source quantization of a weight tensor.
+ *
+ * This exists only to size and digest the SOURCE bytes. The device never sees
+ * these formats: build_blob_cache.py dequantizes offline and authors a weight
+ * image of per-channel i8 (or exact FP16) rows, and the NPU path validates that
+ * image against the source digest. So adding a type here is a lookup change, not
+ * a kernel change.
+ *
+ * Zero is Q8_0 so existing positional initializers of hpi_q8_0_gemm, which do not
+ * mention the field, keep their current meaning.
+ */
+typedef enum {
+    HPI_W_Q8_0 = 0,
+    HPI_W_Q4_K = 1
+} hpi_weight_type;
+
+/* Bytes in one packed row of K elements, or 0 if K is not block-aligned for the
+ * type. Callers must treat 0 as "reject", never as "empty". */
+static inline int64_t hpi_weight_row_bytes(hpi_weight_type type, int64_t k) {
+    if (k <= 0) return 0;
+    switch (type) {
+        case HPI_W_Q8_0: return (k % HPI_QK8_0) ? 0 : (k / HPI_QK8_0) * (int64_t)sizeof(hpi_block_q8_0);
+        case HPI_W_Q4_K: return (k % HPI_QK4_K) ? 0 : (k / HPI_QK4_K) * HPI_Q4_K_BYTES;
+        default:         return 0;
+    }
+}
+
 /* Dequantize one block to `HPI_QK8_0` floats. Pure; no state. */
 static inline void hpi_q8_0_dequant_block(const hpi_block_q8_0 *b, float *out) {
     const float d = hpi_f16_to_f32(b->d);
@@ -187,9 +218,15 @@ hpi_status hpi_get_profile(const hpi_device *dev, hpi_profile *out);
  */
 typedef struct {
     int64_t                 M, N, K;
-    const hpi_block_q8_0   *w;  /* N * (K/HPI_QK8_0) blocks */
+    /* Packed source rows. For HPI_W_Q8_0 these are N*(K/HPI_QK8_0) hpi_block_q8_0,
+     * which is why the pointer has that type. For any other `wtype` it is the raw
+     * packed stream of N * hpi_weight_row_bytes(wtype, K) bytes and must NOT be
+     * dereferenced as Q8_0 blocks; only the NPU path, which digests it and looks
+     * up a pre-authored image, may consume it. The CPU reference rejects them. */
+    const hpi_block_q8_0   *w;
     const float            *x;  /* M * K floats */
     float                  *y;  /* M * N floats (output) */
+    hpi_weight_type         wtype; /* last, and 0 = Q8_0, so old initializers still mean Q8_0 */
 } hpi_q8_0_gemm;
 
 /* Is a given backend usable on this build/platform right now? (Cheap; no device open.) */

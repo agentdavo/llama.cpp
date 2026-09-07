@@ -93,6 +93,23 @@ static size_t ggml_backend_npu_cmx_need(int64_t K, int64_t N) {
     return s1 + SB;
 }
 
+// Source types whose packed rows the DPU path can look up. The device only ever sees the
+// per-channel i8 / FP16 image build_blob_cache.py authors offline, so a type is admissible here
+// exactly when that tool authors images for it. Q4_K is opt-in (GGML_NPU_Q4_K=1) until the cache
+// carries Q4_K entries: claiming a shape with no blob is worse than declining it, because the op
+// then falls to the slow scalar reference instead of fast ggml-cpu.
+static bool ggml_backend_npu_source_type_ok(enum ggml_type t, hpi_weight_type * out) {
+    if (t == GGML_TYPE_Q8_0) { if (out) *out = HPI_W_Q8_0; return true; }
+    if (t == GGML_TYPE_Q4_K) {
+        static int q4k = -1;
+        if (q4k < 0) { const char * e = getenv("GGML_NPU_Q4_K"); q4k = (e && e[0] && e[0] != '0') ? 1 : 0; }
+        if (!q4k) return false;
+        if (out) *out = HPI_W_Q4_K;
+        return true;
+    }
+    return false;
+}
+
 // A cacheable Q8_0 mul_mat shape: build_blob_cache authors an M=1 (decode) blob for any N%SLABCH==0,
 // and an M<=256 (prefill) blob for K in {1024,2048}. Match that so GPU-passthrough routes exactly the
 // ops with a DPU blob to the DPU, and sends the rest (lm_head N%256!=0, M>256, K=3072 prefill) to the
@@ -102,11 +119,13 @@ static bool ggml_backend_npu_dpu_cacheable(const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
     if (!src0 || !src1) return false;
-    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    if (!ggml_backend_npu_source_type_ok(src0->type, NULL) ||
+        src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1], M = op->ne[1];
     if (K <= 0 || K > NPU_M1_K_MAX || N <= 0 || N > NPU_CMX_BUDGET / 2 || M <= 0) return false;
-    if (N % NPU_SLABCH != 0 || K % 32 != 0) return false;
+    { hpi_weight_type wt; if (!ggml_backend_npu_source_type_ok(src0->type, &wt) ||
+        N % NPU_SLABCH != 0 || !hpi_weight_row_bytes(wt, K)) return false; }
     if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // authoring tool skips it -> so must we
     {   // Diagnostic placement knobs: keep ops outside [GGML_NPU_MIN_K, GGML_NPU_MAX_K] on the CPU (numerics A/B).
         static int64_t min_k = -1, max_k = -1;
@@ -132,12 +151,14 @@ static bool ggml_backend_npu_mmid_cacheable(const struct ggml_tensor * op) {
     const struct ggml_tensor * src1 = op->src[1];   // activations [K, ne11, n_tokens]
     const struct ggml_tensor * ids  = op->src[2];   // expert ids [n_expert_used, n_tokens]
     if (!src0 || !src1 || !ids) return false;
-    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    if (!ggml_backend_npu_source_type_ok(src0->type, NULL) ||
+        src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
     if (ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1];
     if (K <= 0 || K > NPU_M1_K_MAX || N <= 0 || N > NPU_CMX_BUDGET / 2) return false;
-    if (N % NPU_SLABCH != 0 || K % 32 != 0) return false;
+    { hpi_weight_type wt; if (!ggml_backend_npu_source_type_ok(src0->type, &wt) ||
+        N % NPU_SLABCH != 0 || !hpi_weight_row_bytes(wt, K)) return false; }
     if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // same CMX limit as the 2D path
 
     // MEASURED 2026-09-04 (unsloth Qwen3.8-Flash-Next): claiming these is a NET LOSS today, so it is
@@ -170,13 +191,14 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+    hpi_weight_type wtype = HPI_W_Q8_0;
+    GGML_ASSERT(ggml_backend_npu_source_type_ok(src0->type, &wtype));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ne00 == ne10);                       // K
     GGML_ASSERT(ne0  == ne01);                       // N
     GGML_ASSERT(ne1  == ne11);                        // M
-    GGML_ASSERT(nb00 == ggml_type_size(GGML_TYPE_Q8_0)); // src0 block-contiguous
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));  // src0 block-contiguous, whatever the source type
     GGML_ASSERT(nb10 == (int64_t) sizeof(float));                  // src1 contiguous rows
     GGML_ASSERT(nb0  == (int64_t) sizeof(float));                  // dst  contiguous rows
 
@@ -202,7 +224,7 @@ static void ggml_backend_npu_mul_mat(ggml_backend_npu_context * ctx, struct ggml
             const float          * x = (const float *)         ((const char *) src1->data + i12*nb12 + i13*nb13);
             float                * y = (float *)               ((      char *) dst ->data + i12*nb2  + i13*nb3);
 
-            const hpi_q8_0_gemm op = { M, N, K, w, x, y };
+            const hpi_q8_0_gemm op = { M, N, K, w, x, y, wtype };
             const hpi_status st = hpi_q8_0_gemm_run(ctx->hpi, &op);
             if (st != HPI_OK) {
                 GGML_LOG_ERROR("hpi-3720: Q8_0 gemm failed st=%d (%s) op='%s' M=%lld N=%lld K=%lld\n",
@@ -237,13 +259,14 @@ static void ggml_backend_npu_mul_mat_id(ggml_backend_npu_context * ctx, struct g
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+    hpi_weight_type wtype = HPI_W_Q8_0;
+    GGML_ASSERT(ggml_backend_npu_source_type_ok(src0->type, &wtype));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
     GGML_ASSERT(ne00 == ne10);                       // K
     GGML_ASSERT(ne0  == ne01);                       // N (dst->ne[0])
-    GGML_ASSERT(nb00 == ggml_type_size(GGML_TYPE_Q8_0)); // expert rows block-contiguous
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));  // expert rows block-contiguous, whatever the source type
     GGML_ASSERT(nb10 == sizeof(float));                  // src1 contiguous rows
 
     const int64_t K = ne00, N = ne01, n_expert = ne02;
@@ -266,7 +289,7 @@ static void ggml_backend_npu_mul_mat_id(ggml_backend_npu_context * ctx, struct g
             const float          * x = (const float *)         ((const char *) src1->data + i11*nb11 + iid1*nb12);
             float                * y = (float *)               ((      char *) dst ->data + id*nb1  + iid1*nb2);
             GGML_ASSERT(nops < NPU_MMID_MAX);
-            ops[nops++] = hpi_q8_0_gemm{ 1, N, K, w, x, y };
+            ops[nops++] = hpi_q8_0_gemm{ 1, N, K, w, x, y, wtype };
         }
         if (nops == 0) continue;
         const hpi_status st = hpi_q8_0_gemm_batch(ctx->hpi, ops, nops);
@@ -577,11 +600,17 @@ static enum ggml_status ggml_backend_npu_graph_compute(ggml_backend_t backend, s
                 flush_dpu();
                 flush_cpu(); // A dependency can have fallen back to the CPU batch.
             }
+            // The source type must travel with the op. It sizes the packed rows the
+            // blob lookup digests, and Q8_0 rows are larger than Q4_K rows, so
+            // defaulting this would hash past the end of a Q4_K tensor.
+            hpi_weight_type batch_wtype = HPI_W_Q8_0;
+            GGML_ASSERT(ggml_backend_npu_source_type_ok(node->src[0]->type, &batch_wtype));
             dpu_ops[n_dpu] = hpi_q8_0_gemm{
                 node->ne[1], node->src[0]->ne[1], node->src[0]->ne[0],
                 (const hpi_block_q8_0 *) node->src[0]->data,
                 (const float *)          node->src[1]->data,
                 (float *)                node->data,
+                batch_wtype,
             };
             {
                 const int64_t N = node->src[0]->ne[1], K = node->src[0]->ne[0], M = node->ne[1];
@@ -812,7 +841,7 @@ static bool ggml_backend_npu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
-            return src0->type == GGML_TYPE_Q8_0 &&
+            return ggml_backend_npu_source_type_ok(src0->type, NULL) &&
                    src1->type == GGML_TYPE_F32  &&
                    op->type   == GGML_TYPE_F32  &&
                    ggml_is_contiguous(src0)     &&
