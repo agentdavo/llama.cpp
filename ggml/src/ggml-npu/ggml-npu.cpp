@@ -93,6 +93,36 @@ static size_t ggml_backend_npu_cmx_need(int64_t K, int64_t N) {
     return s1 + SB;
 }
 
+// CMX need for an explicit slab, so a shape can be tested against the slab the
+// author would actually choose rather than against one fixed policy.
+static size_t ggml_backend_npu_cmx_need_slab(int64_t K, int64_t N, size_t slabch, size_t wbytes) {
+    const size_t n_tile = (size_t) N / 2u;
+    const size_t SB = slabch * 16u + slabch * (size_t) K * wbytes;
+    const size_t out = ((size_t) K * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
+    const size_t s0 = (out + n_tile * 2u + 0xFFFu) & ~(size_t) 0xFFFu;
+    const size_t s1 = (s0 + SB + 0xFFFu) & ~(size_t) 0xFFFu;
+    return s1 + SB;
+}
+
+// Does SOME two-tile slab describe this shape? MUST MIRROR the slab chooser in
+// re/build_blob_cache.py's author_expert_stack(): largest multiple of 32 that
+// halves cleanly across both tiles and fits CMX.
+//
+// The 2D rule (N % NPU_SLABCH) cannot express an expert's N=640, because two
+// tiles of 320 channels are not divisible by 256 or 128 — so the fixed rule
+// would decline every expert even with a valid cache entry present. This is used
+// only by the expert predicate; the 2D path keeps its original rule, which is
+// what its authoring policy still uses.
+static bool ggml_backend_npu_expert_slab_ok(int64_t K, int64_t N) {
+    if (N <= 0 || (N % 64) != 0) return false;            // needs a 32-multiple slab on each of two tiles
+    const size_t wbytes = K <= 1024 ? 2u : 1u;            // v3 authors K<=1024 as exact FP16
+    for (int64_t slab = ((N / 2) / 32) * 32; slab > 0; slab -= 32) {
+        if (N % (2 * slab)) continue;
+        if (ggml_backend_npu_cmx_need_slab(K, N, (size_t) slab, wbytes) <= NPU_CMX_BUDGET) return true;
+    }
+    return false;
+}
+
 // Source types whose packed rows the DPU path can look up. The device only ever sees the
 // per-channel i8 / FP16 image build_blob_cache.py authors offline, so a type is admissible here
 // exactly when that tool authors images for it. Q4_K is opt-in (GGML_NPU_Q4_K=1) until the cache
@@ -157,9 +187,11 @@ static bool ggml_backend_npu_mmid_cacheable(const struct ggml_tensor * op) {
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
     const int64_t K = src0->ne[0], N = src0->ne[1];
     if (K <= 0 || K > NPU_M1_K_MAX || N <= 0 || N > NPU_CMX_BUDGET / 2) return false;
+    // Experts use the author's slab chooser, not the 2D fixed-slab rule: an
+    // expert's N=640 has no valid fixed slab, so the 2D rule would decline
+    // every expert even with a cache entry present.
     { hpi_weight_type wt; if (!ggml_backend_npu_source_type_ok(src0->type, &wt) ||
-        N % NPU_SLABCH != 0 || !hpi_weight_row_bytes(wt, K)) return false; }
-    if (ggml_backend_npu_cmx_need(K, N) > NPU_CMX_BUDGET) return false;  // same CMX limit as the 2D path
+        !hpi_weight_row_bytes(wt, K) || !ggml_backend_npu_expert_slab_ok(K, N)) return false; }
 
     // MEASURED 2026-09-04 (unsloth Qwen3.8-Flash-Next): claiming these is a NET LOSS today, so it is
     // opt-in. build_blob_cache.py authors blobs for 2D tensors ONLY (it skips len(ne)!=2), so a 3D
